@@ -8,6 +8,7 @@
 
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "psx/gtereg.h"
@@ -63,16 +64,31 @@ extern "C" unsigned PGXP_CurGen(void) { return s_pgxpGen; }
 struct ShadowEntry { uintptr_t key; unsigned gen; unsigned value; float x, y, w; };
 /* Must hold every projected vertex word AND every copied prim-field word for one
  * frame (~230k verts -> up to ~1M words). 2^21 open-addressed, 16-probe. */
+#if defined(__vita__)
+/* Vita: .bss is committed RAM there, not demand-zero, and at 2^21 the two
+ * tables took 136 MB before the game ran. A quarter of the entries, allocated
+ * only once the feature that needs them runs (PGXP is off by default). */
+#define SHADOW_BITS 19
+#else
 #define SHADOW_BITS 21
+#endif
 #define SHADOW_SIZE (1u << SHADOW_BITS)
 #define SHADOW_MASK (SHADOW_SIZE - 1u)
+#if defined(__vita__)
+static ShadowEntry* s_shadow = nullptr;
+#else
 static ShadowEntry s_shadow[SHADOW_SIZE];
+#endif
 
 static inline unsigned ShadowHash(uintptr_t k) {
 	return (unsigned)((k >> 2) * 2654435761u) & SHADOW_MASK;
 }
 
 static void Shadow_Put(void* addr, float x, float y, float w, unsigned value) {
+#if defined(__vita__)
+	if (s_shadow == nullptr && (s_shadow = (ShadowEntry*)calloc(SHADOW_SIZE, sizeof(ShadowEntry))) == nullptr)
+		return;
+#endif
 	uintptr_t k = (uintptr_t)addr;
 	unsigned s = ShadowHash(k);
 	for (int i = 0; i < 16; i++) {
@@ -88,6 +104,10 @@ static void Shadow_Put(void* addr, float x, float y, float w, unsigned value) {
 }
 
 static const ShadowEntry* Shadow_Get(const void* addr) {
+#if defined(__vita__)
+	if (s_shadow == nullptr)
+		return nullptr;
+#endif
 	uintptr_t k = (uintptr_t)addr;
 	unsigned s = ShadowHash(k);
 	for (int i = 0; i < 16; i++) {
@@ -138,10 +158,18 @@ extern "C" float g_PsyX_CharaFade = 0.0f;
  * each push their own SetGeomScreen. A frame-global therefore reprojects clip
  * vertices with whichever values the LAST RTPS of the frame happened to leave. */
 struct VsEntry { uintptr_t key; unsigned gen; unsigned value; float vx, vy, vz; float nocast; float fade; float ofx, ofy, h; };
+#if defined(__vita__)
+static VsEntry* s_vshadow = nullptr;
+#else
 static VsEntry s_vshadow[SHADOW_SIZE];
+#endif
 
 static void Vs_Put(void* addr, float vx, float vy, float vz, float nocast, unsigned value,
                    float ofx, float ofy, float h, float fade = 0.0f) {
+#if defined(__vita__)
+	if (s_vshadow == nullptr && (s_vshadow = (VsEntry*)calloc(SHADOW_SIZE, sizeof(VsEntry))) == nullptr)
+		return;
+#endif
 	uintptr_t k = (uintptr_t)addr;
 	unsigned s = ShadowHash(k);
 	for (int i = 0; i < 16; i++) {
@@ -157,6 +185,10 @@ static void Vs_Put(void* addr, float vx, float vy, float vz, float nocast, unsig
 }
 
 static const VsEntry* Vs_Get(const void* addr, unsigned value) {
+#if defined(__vita__)
+	if (s_vshadow == nullptr)
+		return nullptr;
+#endif
 	uintptr_t k = (uintptr_t)addr;
 	unsigned s = ShadowHash(k);
 	for (int i = 0; i < 16; i++) {
