@@ -1947,6 +1947,7 @@ typedef struct
 	GLint fogColorLoc;
 	GLint voidProbeLoc;
 	GLint fogToBlackLoc;
+	GLint blendSrcLoc;
 	GLint fogStrengthLoc;
 	GLint pgxpEnabledLoc;
 	GLint szMaxLoc;
@@ -1993,6 +1994,7 @@ GLint u_fogColorLoc;
 GLint u_voidProbeLoc;
 extern "C" int g_PsxVoidProbeArmed;
 GLint u_fogToBlackLoc;
+GLint u_blendSrcLoc;
 GLint u_fogStrengthLoc;
 GLint u_pgxpEnabledLoc;
 GLint u_szMaxLoc;
@@ -2028,6 +2030,9 @@ static int s_shadowTexSize = 0;
 #define PSYX_SHADOW_MAP_SIZE g_PsyX_ShadowMapSize
 static GLuint g_shadowFBO = 0;
 static GLuint g_shadowDepthTex = 0;
+#if defined(PSYX_VITA)
+static GLuint g_shadowDepthRbo = 0;
+#endif
 static ShaderID g_shadowDepthShader = (ShaderID)-1;
 static GLint g_shadowDepthMatrixLoc = -1;
 static float g_shadowLightMatrix[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
@@ -2043,6 +2048,10 @@ float g_PsyX_FogStrength = 1.1f;
  * light fog color — which whitened their edges/faded pixels in daytime. Set by
  * GR_SetBlendMode; pushed to the shader as u_fogToBlack. */
 int g_PsxFogToBlack = 0;
+/* Vita only: GXM has no constant blend colour, so the two modes that need one
+ * scale the source in the fragment shader instead (u_blendSrc). x = colour
+ * scale, y = 1 to write x as the source alpha. Set by GR_SetBlendMode. */
+static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 
 /* Colour comes from a CPU-baked table (GR_InitRG8LUT) on texture unit 2
  * instead of being reconstructed per pixel with float division + floor():
@@ -2419,6 +2428,26 @@ int g_PsxFogToBlack = 0;
 	"		v_shadowViewPos = vec4(a_viewpos * shadowInvZ, shadowInvZ) * shadowClipW;\n"\
 	"	}\n"
 
+/* Vita has no depth textures: the shadow map is window depth packed into
+ * RGBA8 by s_shadowDepthShaderSrc, unpacked here. */
+#if defined(PSYX_VITA)
+#	define GPU_SHADOW_FETCH_FUNC\
+	"	float shFetch(vec2 uv) { return dot(texture2D(u_shadowTex, uv), vec4(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 16581375.0)); }\n"
+#else
+#	define GPU_SHADOW_FETCH_FUNC\
+	"	float shFetch(vec2 uv) { return texture2D(u_shadowTex, uv).r; }\n"
+#endif
+
+#if defined(PSYX_VITA)
+#	define GPU_BLEND_SRC_UNIFORM\
+	"	uniform vec2 u_blendSrc;\n"
+#	define GPU_BLEND_SRC_SCALE\
+	"		fragColor = vec4(fragColor.rgb * u_blendSrc.x, (u_blendSrc.y > 0.5) ? u_blendSrc.x : fragColor.a * u_blendSrc.x);\n"
+#else
+#	define GPU_BLEND_SRC_UNIFORM ""
+#	define GPU_BLEND_SRC_SCALE ""
+#endif
+
 /* Fog + per-pixel flashlight + shadow uniforms shared by every shader that
  * renders lit world geometry - including the 32-bit RGBA override shader,
  * whose textures (virtual pool slots, hi-res/pack replacements) cover the
@@ -2426,6 +2455,7 @@ int g_PsxFogToBlack = 0;
 #define GPU_LIT_UNIFORMS\
 	"	uniform vec3 u_fogColor;\n"\
 	"	uniform int u_fogToBlack;\n"\
+	GPU_BLEND_SRC_UNIFORM\
 	"	uniform float u_fogStrength;\n"\
 	"	uniform int u_voidProbe;\n"\
 	"	uniform int u_flashlightOn;\n"\
@@ -2446,6 +2476,7 @@ int g_PsxFogToBlack = 0;
 	"	uniform float u_shadowStrength;\n"\
 	"	uniform vec2 u_shadowClip;\n"\
 	"	uniform float u_shadowFadeDist;\n"\
+	GPU_SHADOW_FETCH_FUNC\
 	/* Window depth [0,1] -> linear distance along the light's forward axis, using the shadow frustum's near/far (u_shadowClip). Lets us measure how far a receiver sits BEHIND its occluder in world units. */\
 	"	float shLinDepth(float zw) {\n"\
 	"		float ndc = zw * 2.0 - 1.0;\n"\
@@ -2535,7 +2566,7 @@ int g_PsxFogToBlack = 0;
 	"									float wx = (sx == -1) ? (1.0 - texelFrac.x) : ((sx == 2) ? texelFrac.x : 1.0);\n"\
 	"									float weight = wx * wy;\n"\
 	"									vec2 suv = (texelBase + vec2(float(sx), float(sy)) + vec2(0.5)) * u_shadowTexel;\n"\
-	"									float sd = texture2D(u_shadowTex, suv).r;\n"\
+	"									float sd = shFetch(suv);\n"\
 	"									float receiverDepth = luv.z + dzdu * (suv.x - luv.x) + dzdv * (suv.y - luv.y);\n"\
 	"									if (receiverDepth - u_shadowBias > sd) {\n"\
 	"										if (u_shadowFadeDist > 0.0) {\n"\
@@ -2616,6 +2647,7 @@ int g_PsxFogToBlack = 0;
 	"			fragColor.rgb *= clamp(g_tapCov / g_tapWt, 0.0, 1.0);\n"\
 	GPU_LIT_TAIL\
 	GPU_DITHERING_NO_VCOLOR\
+	GPU_BLEND_SRC_SCALE\
 	"	}\n"
 
 const char* gte_shader_4 =
@@ -2738,6 +2770,7 @@ const char* gte_shader_32_rgba =
 	"		fragColor.a *= v_color.a;\n"\
 	GPU_LIT_TAIL\
 	GPU_DITHERING_NO_VCOLOR\
+	GPU_BLEND_SRC_SCALE\
 	"	}\n"
 	"#endif\n";
 
@@ -3147,6 +3180,7 @@ static void GR_InitialisePSXShader(GTEShader* sh, ShaderID shader)
 	sh->fogColorLoc = glGetUniformLocation(sh->shader, "u_fogColor");
 	sh->voidProbeLoc = glGetUniformLocation(sh->shader, "u_voidProbe");
 	sh->fogToBlackLoc = glGetUniformLocation(sh->shader, "u_fogToBlack");
+	sh->blendSrcLoc = glGetUniformLocation(sh->shader, "u_blendSrc");
 	sh->fogStrengthLoc = glGetUniformLocation(sh->shader, "u_fogStrength");
 	sh->pgxpEnabledLoc = glGetUniformLocation(sh->shader, "u_pgxpEnabled");
 	sh->szMaxLoc = glGetUniformLocation(sh->shader, "u_szMax");
@@ -3541,6 +3575,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_fogColorLoc = shader->fogColorLoc;
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
+		u_blendSrcLoc = shader->blendSrcLoc;
 		u_fogStrengthLoc = shader->fogStrengthLoc;
 		u_pgxpEnabledLoc = shader->pgxpEnabledLoc;
 		u_szMaxLoc = shader->szMaxLoc;
@@ -3578,6 +3613,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_fogColorLoc = shader->fogColorLoc;
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
+		u_blendSrcLoc = shader->blendSrcLoc;
 		u_fogStrengthLoc = shader->fogStrengthLoc;
 		u_pgxpEnabledLoc = shader->pgxpEnabledLoc;
 		u_szMaxLoc = shader->szMaxLoc;
@@ -3615,6 +3651,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_fogColorLoc = shader->fogColorLoc;
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
+		u_blendSrcLoc = shader->blendSrcLoc;
 		u_fogStrengthLoc = shader->fogStrengthLoc;
 		u_pgxpEnabledLoc = shader->pgxpEnabledLoc;
 		u_szMaxLoc = shader->szMaxLoc;
@@ -3657,6 +3694,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_fogColorLoc = shader->fogColorLoc;
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
+		u_blendSrcLoc = shader->blendSrcLoc;
 		u_fogStrengthLoc = shader->fogStrengthLoc;
 		u_pgxpEnabledLoc = shader->pgxpEnabledLoc;
 		u_szMaxLoc = shader->szMaxLoc;
@@ -3710,6 +3748,8 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 
 	if (u_fogToBlackLoc != -1)
 		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
+	if (u_blendSrcLoc != -1)
+		glUniform2fv(u_blendSrcLoc, 1, g_PsxBlendSrc);
 
 	if (u_fogStrengthLoc != -1)
 		glUniform1f(u_fogStrengthLoc, g_PsyX_FogStrength);
@@ -4969,6 +5009,11 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 #define PSYX_HAS_POSTPROCESS 0
 #endif
 
+/* Set nonzero by the Brightness screen so GR_PostProcess overlays the reference
+ * bar; cleared when it exits. Defined without post-processing too: the game
+ * writes it either way. */
+extern "C" { int g_cfg_calibBar = 0; }
+
 #if PSYX_HAS_POSTPROCESS
 
 static ShaderID g_postShader = (ShaderID)-1;
@@ -4983,9 +5028,6 @@ static GLint    g_postLoc_contrast = -1;
 static GLint    g_postLoc_satur = -1;
 static GLint    g_postLoc_calib = -1;
 
-/* Set nonzero by the Brightness screen so GR_PostProcess overlays the reference
- * bar; cleared when it exits. */
-extern "C" { int g_cfg_calibBar = 0; }
 static GLuint   g_postVAO = 0;
 static GLuint   g_postFBO = 0;
 static TextureID g_postTex = (TextureID)-1;
@@ -5288,6 +5330,32 @@ void GR_PostProcess(void) {}
  * ---------------------------------------------------------------------- */
 #if USE_OPENGL
 
+#if defined(PSYX_VITA)
+/* Depth goes to an RGBA8 colour target (no depth textures on vitaGL), so the
+ * polygon offset the desktop pass gets from glPolygonOffset(1.5, 1.0) on a
+ * 24-bit depth buffer is applied to the packed value by hand. */
+static const char* s_shadowDepthShaderSrc =
+	"varying vec2 v_shadowZW;\n"
+	"#ifdef VERTEX\n"
+	"attribute vec3 a_viewpos;\n"
+	"attribute vec3 a_normal;\n"
+	"uniform mat4 u_shadowMatrix;\n"
+	"void main() {\n"
+	"	if (a_normal.y < 0.5 || a_viewpos.z <= 0.0 || a_normal.x > 0.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); v_shadowZW = vec2(2.0, 1.0); return; }\n"
+	"	gl_Position = u_shadowMatrix * vec4(a_viewpos, 1.0);\n"
+	"	v_shadowZW = gl_Position.zw;\n"
+	"}\n"
+	"#else\n"
+	"void main() {\n"
+	"	float d = v_shadowZW.x / v_shadowZW.y * 0.5 + 0.5;\n"
+	"	d += 1.5 * max(abs(dFdx(d)), abs(dFdy(d))) + 1.0 / 16777216.0;\n"
+	"	d = clamp(d, 0.0, 0.999999);\n"
+	"	vec4 enc = fract(d * vec4(1.0, 255.0, 65025.0, 16581375.0));\n"
+	"	enc -= enc.yzww * vec4(1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0, 0.0);\n"
+	"	gl_FragColor = enc;\n"
+	"}\n"
+	"#endif\n";
+#else
 static const char* s_shadowDepthShaderSrc =
 	"#ifdef VERTEX\n"
 	"attribute vec3 a_viewpos;\n"
@@ -5301,6 +5369,7 @@ static const char* s_shadowDepthShaderSrc =
 	"#else\n"
 	"void main() { }\n"
 	"#endif\n";
+#endif
 
 static void sh_normalize3(float* v)
 {
@@ -5382,6 +5451,10 @@ static void GR_EnsureShadowTarget(void)
 		glDeleteTextures(1, &g_shadowDepthTex);
 		g_shadowFBO      = 0;
 		g_shadowDepthTex = 0;
+#if defined(PSYX_VITA)
+		glDeleteRenderbuffers(1, &g_shadowDepthRbo);
+		g_shadowDepthRbo = 0;
+#endif
 	}
 
 	if (g_shadowFBO != 0)
@@ -5389,6 +5462,29 @@ static void GR_EnsureShadowTarget(void)
 
 	s_shadowTexSize = g_PsyX_ShadowMapSize;
 
+#if defined(PSYX_VITA)
+	/* NEAREST is required, not a choice: filtering would blend the packed
+	 * bytes. The receiver's PCF does its own weighting. */
+	glGenTextures(1, &g_shadowDepthTex);
+	glBindTexture(GL_TEXTURE_2D, g_shadowDepthTex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE,
+	             0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	glGenRenderbuffers(1, &g_shadowDepthRbo);
+	glBindRenderbuffer(GL_RENDERBUFFER, g_shadowDepthRbo);
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE);
+	glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+	glGenFramebuffers(1, &g_shadowFBO);
+	glBindFramebuffer(GL_FRAMEBUFFER, g_shadowFBO);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_shadowDepthTex, 0);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_shadowDepthRbo);
+#else
 	glGenTextures(1, &g_shadowDepthTex);
 	glBindTexture(GL_TEXTURE_2D, g_shadowDepthTex);
 	/* ES pairs DEPTH_COMPONENT24 with UNSIGNED_INT only -- FLOAT is legal solely
@@ -5445,6 +5541,7 @@ static void GR_EnsureShadowTarget(void)
 	}
 #endif
 	glReadBuffer(GL_NONE);
+#endif /* PSYX_VITA */
 
 	/* An incomplete shadow FBO does not fail loudly -- it just makes every
 	 * receiver read as shadowed. Say so once instead. */
@@ -5457,7 +5554,11 @@ static void GR_EnsureShadowTarget(void)
 		}
 		else
 		{
+#if defined(PSYX_VITA)
+			eprintf("*shadow target ready: %dx%d rgba8-packed depth\n", PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE);
+#else
 			eprintf("*shadow target ready: %dx%d depth24\n", PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE);
+#endif
 		}
 	}
 
@@ -5549,7 +5650,18 @@ void GR_ShadowPassBegin(void)
 	glEnable(GL_DEPTH_TEST);
 	glDepthMask(GL_TRUE);
 	glDepthFunc(GL_LESS);
+#if defined(PSYX_VITA)
+	{
+		/* Cleared to packed 1.0+ so texels nothing was drawn into read as lit. */
+		GLfloat cc[4];
+		glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+		glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		glClearColor(cc[0], cc[1], cc[2], cc[3]);
+	}
+#else
 	glClear(GL_DEPTH_BUFFER_BIT);
+#endif
 
 	glEnable(GL_POLYGON_OFFSET_FILL);
 	glPolygonOffset(1.5f, 1.0f);
@@ -7299,6 +7411,15 @@ void GR_SetBlendMode(BlendMode blendMode)
 	                   blendMode == BM_ADD_QUATER_SOURCE) ? 1 : 0;
 	if (u_fogToBlackLoc != -1)
 		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
+#if defined(PSYX_VITA)
+	/* 0.5, not 0.25: the desktop factor is the blend constant's ALPHA, which
+	 * is 0.5 whenever this mode is reached. */
+	g_PsxBlendSrc[0] = (blendMode == BM_ADD_QUATER_SOURCE) ? 0.5f :
+	                   (blendMode == BM_CONSTANT_ALPHA) ? g_PsxFeedbackDampBlend : 1.0f;
+	g_PsxBlendSrc[1] = (blendMode == BM_CONSTANT_ALPHA) ? 1.0f : 0.0f;
+	if (u_blendSrcLoc != -1)
+		glUniform2fv(u_blendSrcLoc, 1, g_PsxBlendSrc);
+#endif
 	if (blendMode == BM_NONE)
 	{
 		if (g_PreviousBlendMode != BM_NONE)
@@ -7337,14 +7458,15 @@ void GR_SetBlendMode(BlendMode blendMode)
 		glBlendFunc(GL_ONE, GL_ONE);
 		break;
 #if defined(PSYX_VITA)
-	/* KNOWN GAP (no constant blend colour on GXM): mode 3 renders as plain
-	 * additive here, i.e. too bright; feedback damp draws without the trail.
-	 * Fix belongs in the fragment shader (scale src by 0.25 for this mode). */
+	/* Same result as the constant-alpha factors below, with the constant
+	 * applied by the shader (u_blendSrc). Feedback damp keeps the destination
+	 * alpha rather than lerping it, which only differs where the source and
+	 * destination alpha differ. */
 	case BM_ADD_QUATER_SOURCE:
 		glBlendFunc(GL_ONE, GL_ONE);
 		break;
 	case BM_CONSTANT_ALPHA:
-		glBlendFunc(GL_ONE, GL_ZERO);
+		glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
 		break;
 #else
 	case BM_ADD_QUATER_SOURCE:

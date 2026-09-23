@@ -95,7 +95,7 @@
 
 #if defined(PSYX_VITA)
 /* vitaGL compatibility. Everything below is either a desktop-only diagnostic,
- * an optional PC enhancement (MSAA, flashlight shadow maps), or a path that is
+ * an optional PC enhancement (MSAA), or a path that is
  * already runtime-gated off when g_grIsGLES is set -- which it always is here.
  * Anything that changes what the player SEES is listed as a known gap instead
  * of being silently papered over. */
@@ -103,19 +103,12 @@
 /* MSAA is chosen once at vglInitExtended; s_internalSamples is 0 on GLES. */
 #   define glRenderbufferStorageMultisample(t,s,f,w,h) glRenderbufferStorage(t,f,w,h)
 
-/* KNOWN GAP: sceGxm has no constant blend colour, so glBlendColor cannot
- * exist. PSX blend mode 3 (B + F/4) and the PC feedback-damp mode depend on
- * it; GR_SetBlendMode takes an approximation on Vita (see PSYX_VITA there).
- * Proper fix: scale the source colour in the fragment shader instead. */
+/* sceGxm has no constant blend colour, so glBlendColor cannot exist. The two
+ * modes that use it scale the source in the fragment shader instead (see
+ * u_blendSrc in PsyX_render.cpp). */
 #   define glBlendColor(r,g,b,a)        ((void)0)
 #   define GL_CONSTANT_ALPHA            GL_SRC_ALPHA
 #   define GL_ONE_MINUS_CONSTANT_ALPHA  GL_ONE_MINUS_SRC_ALPHA
-
-/* Desktop-only branch of the shadow map (runtime !g_grIsGLES, never taken). */
-#   define GL_CLAMP_TO_BORDER           GL_CLAMP_TO_EDGE
-#   define GL_TEXTURE_BORDER_COLOR      0x1004
-#   define glTexParameterfv(t,p,v)      ((void)0)
-#   define glDrawBuffers(n,b)           ((void)0)
 
 /* Grey-frame / depth-bits diagnostics: PBO readback and attachment queries. */
 #   define GL_PIXEL_PACK_BUFFER         0x88EB

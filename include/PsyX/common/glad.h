@@ -57,13 +57,17 @@ extern unsigned int g_PsyX_DefaultFBO;
 #if defined(__ANDROID__)
 #   include <GLES3/gl3.h>
 #   include <GLES2/gl2ext.h>
-#elif defined(__APPLE__) && TARGET_OS_IPHONE
+#elif (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__vita__)
 /* Same forward as Android, to Apple's framework layout. Without it glad's
  * `#define glActiveTexture glad_glActiveTexture` function-pointer shims collide
  * with the real declarations in OpenGLES/ES3/gl.h ("redefinition as a different
  * kind of symbol") in every TU that reaches this header before that one. */
-#   include <OpenGLES/ES3/gl.h>
-#   include <OpenGLES/ES3/glext.h>
+#   if defined(__vita__)
+#       include <vitaGL.h>
+#   else
+#       include <OpenGLES/ES3/gl.h>
+#       include <OpenGLES/ES3/glext.h>
+#   endif
 
 /* Also shimmed in PsyX/PsyX_render.h — see the note there. The renderer now
  * picks between the desktop and GLES spellings at RUNTIME (g_grCaps), which
@@ -85,6 +89,16 @@ extern unsigned int g_PsyX_DefaultFBO;
 #   endif
 #   ifndef GL_CLAMP_TO_BORDER
 #       define GL_CLAMP_TO_BORDER           0x812D
+#   endif
+/* ES 3.0 core, absent from vitaGL's ES 2.0-class header. */
+#   ifndef GL_TEXTURE_BASE_LEVEL
+#       define GL_TEXTURE_BASE_LEVEL        0x813C
+#   endif
+#   ifndef GL_TEXTURE_MAX_LEVEL
+#       define GL_TEXTURE_MAX_LEVEL         0x813D
+#   endif
+#   ifndef GL_VERTEX_ARRAY_BINDING
+#       define GL_VERTEX_ARRAY_BINDING      0x85B5
 #   endif
 #else
 
