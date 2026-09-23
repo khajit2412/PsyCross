@@ -1895,6 +1895,31 @@ void GR_BeginScene()
 	GR_UpdateVRAM();
 	GR_SetViewPort(0, 0, g_windowWidth, g_windowHeight);
 
+#if defined(PSYX_VITA) && USE_OPENGL
+	/* vitaGL rotates three display buffers and a 2D screen does not clear every
+	 * frame, so the pillarbox bars kept whatever an earlier frame drew there
+	 * (the Konami logo beside the title). Only the bars: the 4:3 image is the
+	 * game's to keep. */
+	if (((g_PcHorPlusEnabled && g_PcWidescreenMode == 0) || (!g_PcHorPlusEnabled && g_PcMenuPillarbox)) &&
+	    g_windowHeight > 0 && g_windowWidth * 3 > g_windowHeight * 4)
+	{
+		const int vpW = (int)(g_windowHeight * 4.0f / 3.0f + 0.5f);
+		const int vpX = (g_windowWidth - vpW) / 2;
+		GLfloat   cc[4];
+
+		glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		glEnable(GL_SCISSOR_TEST);
+		glScissor(0, 0, vpX, g_windowHeight);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glScissor(vpX + vpW, 0, g_windowWidth - vpX - vpW, g_windowHeight);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glDisable(GL_SCISSOR_TEST);
+		glClearColor(cc[0], cc[1], cc[2], cc[3]);
+		g_PreviousScissorState = -999;
+	}
+#endif
+
 	if (g_dbg_wireframeMode)
 	{
 		GR_SetWireframe(1);
@@ -1944,6 +1969,7 @@ typedef struct
 	GLint texelSizeLoc;
 	GLint texOffsetLoc;
 	GLint hiresHalfLoc;
+	GLint hiresSizeLoc;
 	GLint fogColorLoc;
 	GLint voidProbeLoc;
 	GLint fogToBlackLoc;
@@ -1990,6 +2016,7 @@ GLint u_pixelScaleLoc;
 GLint u_texelSizeLoc;
 GLint u_texOffsetLoc;
 GLint u_hiresHalfLoc;
+GLint u_hiresSizeLoc;
 GLint u_fogColorLoc;
 GLint u_voidProbeLoc;
 extern "C" int g_PsxVoidProbeArmed;
@@ -2284,13 +2311,13 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"		vec2 dPdy = dFdy(P);\n"\
 	"		float lx = length(dPdx);\n"\
 	"		float ly = length(dPdy);\n"\
-	"		vec2 major = (lx >= ly) ? dPdx : dPdy;\n"\
+	"		vec2 majorAxis = (lx >= ly) ? dPdx : dPdy;\n"\
 	"		float mn = min(lx, ly);\n"\
 	"		float ratio = (mn > 0.0001) ? (max(lx, ly) / mn) : 1.0;\n"\
 	"		float taps = clamp(floor(ratio), 1.0, u_anisoTaps);\n"\
-	"		float span = length(major) * (taps - 1.0);\n"\
+	"		float span = length(majorAxis) * (taps - 1.0);\n"\
 	"		if (taps <= 1.0 || span <= 0.0) { return BilinearTextureSample(P); }\n"\
-	"		if (span > 4.0) { major *= 4.0 / span; }\n"\
+	"		if (span > 4.0) { majorAxis *= 4.0 / span; }\n"\
 	"		vec4 acc = vec4(0.0);\n"\
 	"		float cov = 0.0;\n"\
 	"		g_tapWt = 0.0;\n"\
@@ -2299,7 +2326,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"		for (int i = 0; i < 16; i++) {\n"\
 	"			if (float(i) >= taps) break;\n"\
 	"			float t = (float(i) + 0.5) / taps - 0.5;\n"\
-	"			acc += BilinearCov(P + major * t, cov);\n"\
+	"			acc += BilinearCov(P + majorAxis * t, cov);\n"\
 	"		}\n"\
 	"		if (cov <= 0.0) { discard; }\n"\
 	"		g_tapCov = cov;\n"\
@@ -2650,16 +2677,46 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	GPU_BLEND_SRC_SCALE\
 	"	}\n"
 
+/* GLSL ES 1.00 has no textureSize / textureLod: on Vita the replacement's size
+ * comes in as u_hiresSize (GR_SetOverrideTextureSize) and the base level is
+ * pinned with texture2DLod, which vitaGL's translator provides. */
+#if defined(PSYX_VITA)
+#	define GPU_HIRES_SIZE_UNIFORM\
+	"	uniform vec2 u_hiresSize;\n"
+#	define GPU_HIRES_POINT_SAMPLE\
+	"			fragColor = texture2DLod(s_texture, (floor(tc * u_hiresSize) + 0.5) / u_hiresSize, 0.0);\n"
+#else
+#	define GPU_HIRES_SIZE_UNIFORM ""
+#	define GPU_HIRES_POINT_SAMPLE\
+	"			vec2 hiresSize = vec2(textureSize(s_texture, 0));\n"\
+	"			fragColor = textureLod(s_texture, (floor(tc * hiresSize) + 0.5) / hiresSize, 0.0);\n"
+#endif
+
+/* vitaGL's GLSL translator gives every varying its own TEXCOORDn and runs out
+ * at eleven ("invalid token TEXCOORD- created by paste operator"), so on Vita
+ * four of the scalars share one vec4. */
+#if defined(PSYX_VITA)
+#	define GTE_SCALAR_VARYINGS\
+	"varying vec4 v_scalars;\n"\
+	"#define v_z v_scalars.x\n"\
+	"#define v_fogAmount v_scalars.y\n"\
+	"#define v_is3d v_scalars.z\n"\
+	"#define v_geom3d v_scalars.w\n"
+#else
+#	define GTE_SCALAR_VARYINGS\
+	"varying float v_z;\n"\
+	"varying float v_fogAmount;\n"\
+	"varying float v_is3d;\n"\
+	"varying float v_geom3d;\n"
+#endif
+
 const char* gte_shader_4 =
 	"AFFINE_VARYING vec4 v_texcoord;\n"
 	"varying vec4 v_color;\n"
 	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
-	"varying float v_z;\n"
-	"varying float v_fogAmount;\n"
-	"varying float v_is3d;\n"
+	GTE_SCALAR_VARYINGS
 	"varying vec3 v_viewpos;\n"
 	"varying float v_fade;\n"
-	"varying float v_geom3d;\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef VERTEX\n"
@@ -2672,12 +2729,9 @@ const char* gte_shader_8 =
 	"AFFINE_VARYING vec4 v_texcoord;\n"
 	"varying vec4 v_color;\n"
 	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
-	"varying float v_z;\n"
-	"varying float v_fogAmount;\n"
-	"varying float v_is3d;\n"
+	GTE_SCALAR_VARYINGS
 	"varying vec3 v_viewpos;\n"
 	"varying float v_fade;\n"
-	"varying float v_geom3d;\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef VERTEX\n"
@@ -2690,12 +2744,9 @@ const char* gte_shader_16 =
 	"AFFINE_VARYING vec4 v_texcoord;\n"
 	"varying vec4 v_color;\n"
 	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
-	"varying float v_z;\n"
-	"varying float v_fogAmount;\n"
-	"varying float v_is3d;\n"
+	GTE_SCALAR_VARYINGS
 	"varying vec3 v_viewpos;\n"
 	"varying float v_fade;\n"
-	"varying float v_geom3d;\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef VERTEX\n"
@@ -2708,12 +2759,9 @@ const char* gte_shader_32_rgba =
 	"AFFINE_VARYING vec4 v_texcoord;\n"
 	"varying vec4 v_color;\n"
 	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
-	"varying float v_z;\n"
-	"varying float v_fogAmount;\n"
-	"varying float v_is3d;\n"
+	GTE_SCALAR_VARYINGS
 	"varying vec3 v_viewpos;\n"
 	"varying float v_fade;\n"
-	"varying float v_geom3d;\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef VERTEX\n"
@@ -2726,6 +2774,7 @@ const char* gte_shader_32_rgba =
 	"	uniform vec2 texelSize;\n"\
 	"	uniform vec2 u_texOffset;\n"\
 	"	uniform vec2 u_hiresHalf;\n"\
+	GPU_HIRES_SIZE_UNIFORM\
 	GPU_LIT_UNIFORMS\
 	"	void main() {\n"\
 	/* u_texOffset: the prim's tpage origin relative to the replaced TIM's
@@ -2751,8 +2800,7 @@ const char* gte_shader_32_rgba =
 	 * native-res replacement already lands on the texel centre (u_hiresHalf == 0.5),
 	 * so it comes out bit-identical either way. */
 	"		if (bilinearFilter == 0 || (bilinearFilter == 1 && v_geom3d < 0.5)) {\n"\
-	"			vec2 hiresSize = vec2(textureSize(s_texture, 0));\n"\
-	"			fragColor = textureLod(s_texture, (floor(tc * hiresSize) + 0.5) / hiresSize, 0.0);\n"\
+	GPU_HIRES_POINT_SAMPLE\
 	"		} else {\n"\
 	"			fragColor = texture2D(s_texture, tc);\n"\
 	"		}\n"\
@@ -3177,6 +3225,7 @@ static void GR_InitialisePSXShader(GTEShader* sh, ShaderID shader)
 	sh->texelSizeLoc = glGetUniformLocation(sh->shader, "texelSize");
 	sh->texOffsetLoc = glGetUniformLocation(sh->shader, "u_texOffset");
 	sh->hiresHalfLoc = glGetUniformLocation(sh->shader, "u_hiresHalf");
+	sh->hiresSizeLoc = glGetUniformLocation(sh->shader, "u_hiresSize");
 	sh->fogColorLoc = glGetUniformLocation(sh->shader, "u_fogColor");
 	sh->voidProbeLoc = glGetUniformLocation(sh->shader, "u_voidProbe");
 	sh->fogToBlackLoc = glGetUniformLocation(sh->shader, "u_fogToBlack");
@@ -3572,6 +3621,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_texelSizeLoc = -1;
 		u_texOffsetLoc = -1;
 		u_hiresHalfLoc = -1;
+		u_hiresSizeLoc = -1;
 		u_fogColorLoc = shader->fogColorLoc;
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
@@ -3610,6 +3660,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_texelSizeLoc = -1;
 		u_texOffsetLoc = -1;
 		u_hiresHalfLoc = -1;
+		u_hiresSizeLoc = -1;
 		u_fogColorLoc = shader->fogColorLoc;
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
@@ -3648,6 +3699,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_texelSizeLoc = -1;
 		u_texOffsetLoc = -1;
 		u_hiresHalfLoc = -1;
+		u_hiresSizeLoc = -1;
 		u_fogColorLoc = shader->fogColorLoc;
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
@@ -3691,6 +3743,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_texelSizeLoc = shader->texelSizeLoc;
 		u_texOffsetLoc = shader->texOffsetLoc;
 		u_hiresHalfLoc = shader->hiresHalfLoc;
+		u_hiresSizeLoc = shader->hiresSizeLoc;
 		u_fogColorLoc = shader->fogColorLoc;
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
@@ -4024,6 +4077,13 @@ void GR_SetOverrideTextureSize(int width, int height, int offsetX, int offsetY,
 		hh[0] = (hx > 0.5f) ? 0.5f : hx;
 		hh[1] = (hy > 0.5f) ? 0.5f : hy;
 		glUniform2fv(u_hiresHalfLoc, 1, hh);
+	}
+
+	if(u_hiresSizeLoc != -1)
+	{
+		float hs[] = { (float)(hiresW > 0 ? hiresW : (width  > 0 ? width  : 1)),
+		               (float)(hiresH > 0 ? hiresH : (height > 0 ? height : 1)) };
+		glUniform2fv(u_hiresSizeLoc, 1, hs);
 	}
 }
 
@@ -6058,11 +6118,22 @@ extern "C" void GR_SetPsxDisplayBuffers(int x0, int y0, int x1, int y1, int w, i
 	g_psxDispBufValid = (w > 0 && h > 0);
 }
 
+/* GLSL ES 1.00 has neither gl_VertexID nor integer bit ops: on Vita the same
+ * three corners come from a vertex buffer (GR_EnsureFbPackTarget). */
+#if defined(PSYX_VITA)
+#	define FB_TRI_DECL "attribute vec2 a_position;\n"
+#	define FB_TRI_POS  "	vec2 p = a_position;\n"
+#else
+#	define FB_TRI_DECL ""
+#	define FB_TRI_POS  "	vec2 p = vec2(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0);\n"
+#endif
+
 static const char* s_fbPackShaderSrc =
 	"varying vec2 v_uv;\n"
 	"#ifdef VERTEX\n"
+	FB_TRI_DECL
 	"void main() {\n"
-	"	vec2 p = vec2(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0);\n"
+	FB_TRI_POS
 	"	v_uv = (p + 1.0) * 0.5;\n"
 	/* The capture below is an unflipped window->texture blit, so texture row 0 is
 	 * the screen BOTTOM. VRAM rows run downward with screen rows (the game samples
@@ -6178,6 +6249,22 @@ static void GR_EnsureFbPackTarget(int w, int h)
 		}
 		glUseProgram(0);
 		glGenVertexArrays(1, &g_fbPackVAO);
+#if defined(PSYX_VITA)
+		{
+			static const float kTri[6] = { -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f };
+			GLuint vbo;
+			GLint  prevBuf = 0;
+			glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
+			glBindVertexArray(g_fbPackVAO);
+			glGenBuffers(1, &vbo);
+			glBindBuffer(GL_ARRAY_BUFFER, vbo);
+			glBufferData(GL_ARRAY_BUFFER, sizeof(kTri), kTri, GL_STATIC_DRAW);
+			glEnableVertexAttribArray(a_position);
+			glVertexAttribPointer(a_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+			glBindVertexArray(0);
+			glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevBuf);
+		}
+#endif
 		glGenTextures(1, &g_fbPackTex);
 		glGenFramebuffers(1, &g_fbPackFBO);
 	}
@@ -7638,8 +7725,15 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 	 * GPU holds the buffer, so it is largest on tilers and shared-memory iGPUs
 	 * and smallest on a discrete desktop card — but it is never a pessimisation,
 	 * and the size is constant so drivers can recycle identical blocks. */
+#if defined(PSYX_VITA)
+	/* vitaGL backs every glBufferData with a fresh GPU allocation (the old one
+	 * is garbage-collected after the frame), so orphaning the full 17 MB here
+	 * allocated it several times per frame. One allocation of what is used. */
+	glBufferData(GL_ARRAY_BUFFER, num_vertices * sizeof(GrVertex), vertices, GL_STREAM_DRAW);
+#else
 	glBufferData(GL_ARRAY_BUFFER, MAX_VERTEX_BUFFER_SIZE * sizeof(GrVertex), NULL, GL_STREAM_DRAW);
 	glBufferSubData(GL_ARRAY_BUFFER, 0, num_vertices * sizeof(GrVertex), vertices);
+#endif
 #else
 #error
 #endif

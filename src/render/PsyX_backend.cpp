@@ -416,6 +416,20 @@ const char* PsyX_Shader_Preamble(int fragmentStage, int dialect)
 	 * enforcing rules they were never written against. */
 	static const char* const kGlLegacy  = "";
 
+#if defined(__vita__)
+	/* vitaGL is ES 2.0 only: the modern bodies are mapped onto GLSL ES 1.00.
+	 * Fragment output has no ES 1.00 spelling but gl_FragColor, so the bodies
+	 * skip their `out vec4 fragColor;` when PSYX_FRAGCOLOR_BUILTIN is set. */
+	static const char* const kVitaModernVert =
+		"#version 100\nprecision highp float;\n"
+		"#define in attribute\n#define out varying\n";
+	static const char* const kVitaModernFrag =
+		"#version 100\nprecision highp float;\n"
+		"#define PSYX_FRAGCOLOR_BUILTIN\n#define in varying\n"
+		"#define texture texture2D\n#define fragColor gl_FragColor\n";
+	if (dialect != PSYX_GLSL_LEGACY)
+		return fragmentStage ? kVitaModernFrag : kVitaModernVert;
+#endif
 	if (g_grIsGLES)
 	{
 		if (dialect == PSYX_GLSL_LEGACY)

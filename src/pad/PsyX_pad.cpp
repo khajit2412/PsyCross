@@ -58,6 +58,9 @@ static int g_activeControllerSlot = 0;
 /* Touch controls live in the port (pc_touch.c), which knows about game state;
  * declared rather than included so PsyCross keeps no pc_port include path. */
 extern "C" void Pc_Touch_Update(void);
+#if defined(__vita__)
+extern "C" unsigned short VitaTouch_PressedBits(void);
+#endif
 extern "C" void Pc_Touch_NoteOtherInput(int padAttached, int keyWord);
 extern "C" int  Pc_Touch_Active(void);
 extern "C" void Pc_Touch_GetPad(unsigned short* word,
@@ -618,6 +621,13 @@ void PsyX_Pad_InternalPadUpdates()
 				pad->id        = 0x73;
 				pad->status    = 0;
 			}
+
+#if defined(__vita__)
+			/* The Vita has no L2/R2; the front-touch corners stand in for them
+			 * (vita_port/vita_touch_buttons.c). */
+			if (i == 0)
+				*(u_short*)pad->buttons &= (u_short)~VitaTouch_PressedBits();
+#endif
 
 			// Update keyboard for PAD
 			if ((g_activeKeyboardControllers & (1 << i)) && kbInputs != 0xffff)
