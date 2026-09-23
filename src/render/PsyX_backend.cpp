@@ -20,6 +20,8 @@ PsyXGlCaps	g_grCaps            = { 1, 1, 1, 1, 1, 1, 1, 1 };
 /* EGL, declared locally rather than vendoring Khronos headers: this needs nine
  * entry points and a page of constants, all of which are ABI-frozen. Values are
  * taken from ANGLE's own eglext_angle.h. */
+/* vitaGL.h already #defines these names for its own EGL shim. */
+#if !defined(__vita__)
 typedef void*		EGLDisplay;
 typedef void*		EGLSurface;
 typedef void*		EGLContext;
@@ -28,6 +30,7 @@ typedef void*		EGLNativeWindowType;
 typedef int			EGLint;
 typedef unsigned	EGLBoolean;
 typedef unsigned	EGLenum;
+#endif
 
 #define PSYX_EGL_NONE					0x3038
 #define PSYX_EGL_FALSE					0

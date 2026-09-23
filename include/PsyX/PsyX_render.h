@@ -31,6 +31,12 @@
 #elif defined(__ANDROID__)
 #   define RENDERER_OGLES
 #   define OGLES_VERSION (3)
+#elif defined(__vita__)
+/* PS Vita through vitaGL: an ES 2.0-class GL over sceGxm. GLSL ES 1.00 is
+ * compiled on-device by vitaShaRK, so the legacy ES2 path is the one used. */
+#   define PSYX_VITA 1
+#   define RENDERER_OGLES
+#   define OGLES_VERSION (2)
 #endif
 
 #if defined(RENDERER_OGL) || defined(RENDERER_OGLES)
@@ -66,6 +72,8 @@
 #else
 #   ifdef __EMSCRIPTEN__
 #      include <GL/gl.h>
+#   elif defined(PSYX_VITA)
+#      include <vitaGL.h>
 #   elif defined(PSYX_IOS)
 /* Apple ships GLES under its own framework layout, not the Khronos paths. */
 #      include <OpenGLES/ES3/gl.h>
@@ -81,8 +89,39 @@
 #endif
 
 /* iOS has no EGL at all — context creation goes through EAGL, which SDL owns. */
-#if !defined(PSYX_IOS)
+#if !defined(PSYX_IOS) && !defined(PSYX_VITA)
 #   include <EGL/egl.h>
+#endif
+
+#if defined(PSYX_VITA)
+/* vitaGL compatibility. Everything below is either a desktop-only diagnostic,
+ * an optional PC enhancement (MSAA, flashlight shadow maps), or a path that is
+ * already runtime-gated off when g_grIsGLES is set -- which it always is here.
+ * Anything that changes what the player SEES is listed as a known gap instead
+ * of being silently papered over. */
+
+/* MSAA is chosen once at vglInitExtended; s_internalSamples is 0 on GLES. */
+#   define glRenderbufferStorageMultisample(t,s,f,w,h) glRenderbufferStorage(t,f,w,h)
+
+/* KNOWN GAP: sceGxm has no constant blend colour, so glBlendColor cannot
+ * exist. PSX blend mode 3 (B + F/4) and the PC feedback-damp mode depend on
+ * it; GR_SetBlendMode takes an approximation on Vita (see PSYX_VITA there).
+ * Proper fix: scale the source colour in the fragment shader instead. */
+#   define glBlendColor(r,g,b,a)        ((void)0)
+#   define GL_CONSTANT_ALPHA            GL_SRC_ALPHA
+#   define GL_ONE_MINUS_CONSTANT_ALPHA  GL_ONE_MINUS_SRC_ALPHA
+
+/* Desktop-only branch of the shadow map (runtime !g_grIsGLES, never taken). */
+#   define GL_CLAMP_TO_BORDER           GL_CLAMP_TO_EDGE
+#   define GL_TEXTURE_BORDER_COLOR      0x1004
+#   define glTexParameterfv(t,p,v)      ((void)0)
+#   define glDrawBuffers(n,b)           ((void)0)
+
+/* Grey-frame / depth-bits diagnostics: PBO readback and attachment queries. */
+#   define GL_PIXEL_PACK_BUFFER         0x88EB
+#   define GL_PIXEL_PACK_BUFFER_BINDING 0x88ED
+#   define GL_DEPTH                     0x1801
+#   define GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE 0x8216
 #endif
 
 /* Desktop-GL / ES 3.2 enums that Apple's ES 3.0 headers do not declare.
@@ -196,7 +235,9 @@ extern unsigned int g_PsyX_DefaultFBO;
 #if defined(RENDERER_OGL)
 #	define VRAM_FORMAT            GL_RG
 #	define VRAM_INTERNAL_FORMAT   GL_RG8
-#elif defined(RENDERER_OGLES) && OGLES_VERSION >= 3
+#elif defined(RENDERER_OGLES) && (OGLES_VERSION >= 3 || defined(PSYX_VITA))
+/* Vita: vitaGL maps GL_RG8 to GXM's renderable U8U8, avoiding ES2's
+ * non-renderable LUMINANCE_ALPHA (the render-to-VRAM passes need it). */
 #	define VRAM_FORMAT            GL_RG
 #	define VRAM_INTERNAL_FORMAT   GL_RG8
 #elif defined(RENDERER_OGLES)

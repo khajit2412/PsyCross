@@ -14,7 +14,7 @@ list(REMOVE_ITEM PSYCROSS_SRCS_CPP
 # SDL2's audio sink, so the legacy AL backend leaves the build here (before
 # add_library, or the removal would come too late to matter) and
 # PsyX_SPUDispatch.cpp collapses onto the software one via PSYX_NO_OPENAL.
-if(ANDROID OR IOS)
+if(ANDROID OR IOS OR VITA)
 	list(REMOVE_ITEM PSYCROSS_SRCS_CPP
 		"${CMAKE_CURRENT_SOURCE_DIR}/src/audio/PsyX_SPULegacy.cpp")
 	# PsyX_SPUSpatial.cpp routes the software SPU through OpenAL placement
@@ -98,6 +98,10 @@ endif()
 if(ANDROID)
     target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
     target_link_libraries(psycross_static GLESv3 EGL android log)
+elseif(VITA)
+    # Software SPU through SDL audio, same as the mobile targets; vitaGL is
+    # linked at the executable (link order matters with vitasdk stubs).
+    target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
 elseif(IOS)
     target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
     # iOS reaches GLES through a framework, and has no EGL — SDL creates the

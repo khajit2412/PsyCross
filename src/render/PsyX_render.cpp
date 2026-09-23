@@ -7129,8 +7129,10 @@ void GR_SwapWindow()
 		PsyX_Angle_Swap();
 	else
 	{
+#if !defined(PSYX_VITA) /* desktop diagnostic: PBO readback every frame */
 		GreyFrame_Present(g_internalFBO ? g_presentWidth : g_windowWidth,
 		                  g_internalFBO ? g_presentHeight : g_windowHeight);
+#endif
 		SDL_GL_SwapWindow(g_window);
 	}
 #endif
@@ -7334,6 +7336,17 @@ void GR_SetBlendMode(BlendMode blendMode)
 	case BM_SUBTRACT:
 		glBlendFunc(GL_ONE, GL_ONE);
 		break;
+#if defined(PSYX_VITA)
+	/* KNOWN GAP (no constant blend colour on GXM): mode 3 renders as plain
+	 * additive here, i.e. too bright; feedback damp draws without the trail.
+	 * Fix belongs in the fragment shader (scale src by 0.25 for this mode). */
+	case BM_ADD_QUATER_SOURCE:
+		glBlendFunc(GL_ONE, GL_ONE);
+		break;
+	case BM_CONSTANT_ALPHA:
+		glBlendFunc(GL_ONE, GL_ZERO);
+		break;
+#else
 	case BM_ADD_QUATER_SOURCE:
 		glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE);
 		break;
@@ -7341,6 +7354,7 @@ void GR_SetBlendMode(BlendMode blendMode)
 		glBlendColor(0.25f, 0.25f, 0.25f, g_PsxFeedbackDampBlend);
 		glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
 		break;
+#endif
 	default:
 		break;
 	}
