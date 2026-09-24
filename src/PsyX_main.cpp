@@ -27,6 +27,9 @@
 
 #include <assert.h>
 #include <string.h>
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -276,6 +279,14 @@ int intrThreadMain(void* data)
 		 * g_SpuMutex (never nested under g_intrMutex), throttles on the
 		 * SDL_GetTicks ms delta, no-op unless `adsr 1`. */
 		PsyX_SPUAL_Update();
+
+#if defined(__vita__)
+		/* The loop never slept. On a desktop that costs one of many cores; the
+		 * Vita gives an app three, and this spin starved the GXM display-queue
+		 * thread that vglSwapBuffers waits on (~36 ms per swap, whatever was
+		 * drawn). 200 us is well inside the 1.73 ms RCnt2 period. */
+		sceKernelDelayThread(200);
+#endif
 	}
 
 	return 0;
@@ -1107,6 +1118,24 @@ uint PsyX_CalcFPS();
  * NULL = nothing extra drawn. */
 extern "C" void (*g_PsyX_PostCaptureHook)(void) = NULL;
 
+#if defined(__vita__)
+/* Where PsyX_EndScene's time goes on Vita (it was 32-38 ms/frame with the GPU
+ * at ~70%): stage totals in microseconds, reported every 300 frames. */
+static Uint64 s_esUs[6];
+static unsigned s_esFrames;
+static Uint64 s_esMark;
+static void ES_Mark(int stage)
+{
+	const Uint64 now = SDL_GetPerformanceCounter();
+	if (stage >= 0)
+		s_esUs[stage] += (now - s_esMark) * 1000000 / SDL_GetPerformanceFrequency();
+	s_esMark = now;
+}
+#define ES_MARK(stage) ES_Mark(stage)
+#else
+#define ES_MARK(stage) ((void)0)
+#endif
+
 void PsyX_EndScene()
 {
 	if (!begin_scene_flag)
@@ -1122,7 +1151,9 @@ void PsyX_EndScene()
 
 	PGXP_CoverageTick();
 
+	ES_MARK(-1);
 	GR_EndScene();
+	ES_MARK(0);
 
 #ifndef PSYX_SKIP_FRAMEBUFFER_STORE
 	/* The naive whole-display-rect store. Disabled for Silent Hill: the PC libgs
@@ -1138,6 +1169,7 @@ void PsyX_EndScene()
 	 * overlays. No-op until GsDefDispBuff2 reports the buffer origins, and
 	 * honours the g_PsxSkipFramebufferStore per-frame opt-out. */
 	GR_StoreFrameBufferPsx();
+	ES_MARK(1);
 
 	/* PC port: g_PsxSkipFramebufferStore is a per-frame opt-out — the game must
 	 * re-set it each tick during a TIM-protect screen (e.g. paper-map pickup). */
@@ -1150,12 +1182,14 @@ void PsyX_EndScene()
 		GR_CaptureLastFrame();
 		GR_VoidProbeScene();
 	}
+	ES_MARK(2);
 
 	/* PC port: draw overlays that must NOT be baked into the freeze-frame (the dev
 	 * console) — AFTER the capture, BEFORE the swap, so the console is a true live
 	 * overlay and never doubles against a frozen copy on pause / "no map" screens. */
 	if (g_PsyX_PostCaptureHook)
 		g_PsyX_PostCaptureHook();
+	ES_MARK(3);
 
 	/* PC port: apply the selected full-screen post-process look (color grade,
 	 * CRT, scanlines, vignette, grain, sharpen, PSX downsample, ...) to the
@@ -1164,9 +1198,26 @@ void PsyX_EndScene()
 		extern void GR_PostProcess(void);
 		GR_PostProcess();
 	}
-
+	ES_MARK(4);
 
 	GR_SwapWindow();
+	ES_MARK(5);
+
+#if defined(__vita__)
+	if (++s_esFrames >= 300)
+	{
+		const double n = (double)s_esFrames;
+		eprintf("[ENDSCENE] ms/frame: end=%.2f fbstore=%.2f capture=%.2f hook=%.2f post=%.2f swap=%.2f\n",
+		        s_esUs[0] / n / 1000.0, s_esUs[1] / n / 1000.0, s_esUs[2] / n / 1000.0,
+		        s_esUs[3] / n / 1000.0, s_esUs[4] / n / 1000.0, s_esUs[5] / n / 1000.0);
+		eprintf("[GLCOUNT] per frame: fboBind=%.1f clear=%.1f readPixels=%.1f copyTex=%.1f texUpload=%.1f draws=%.1f\n",
+		        g_vitaGlCount[VGLC_FBO] / n, g_vitaGlCount[VGLC_CLEAR] / n, g_vitaGlCount[VGLC_READ] / n,
+		        g_vitaGlCount[VGLC_COPYTEX] / n, g_vitaGlCount[VGLC_TEXUP] / n, g_vitaGlCount[VGLC_DRAW] / n);
+		memset(s_esUs, 0, sizeof(s_esUs));
+		memset(g_vitaGlCount, 0, sizeof(g_vitaGlCount));
+		s_esFrames = 0;
+	}
+#endif
 }
 
 #if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)
@@ -1434,6 +1485,11 @@ void PsyX_WaitForTimestep(int count)
 				if (g_cfg_lowEnd)
 					SDL_Delay(1);
 			}
+#if defined(__vita__)
+			/* Always on Vita: the counter only advances on psyX_intr, which a
+			 * spinning main thread can keep off its core. */
+			sceKernelDelayThread(100);
+#endif
 
 			vbl = PsyX_Sys_GetVBlankCount();
 		}

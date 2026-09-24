@@ -1311,7 +1311,7 @@ int GR_InitialiseGLContext(char* windowName, int fullscreen)
 		return 0;
 	}
 
-#if defined(__ANDROID__) || defined(PSYX_IOS)
+#if defined(__ANDROID__) || defined(PSYX_IOS) || defined(PSYX_VITA)
 	/* Both phones hand back a fullscreen surface whose size is the display's,
 	 * not the one requested of SDL_CreateWindow. g_windowWidth/Height feed the
 	 * viewport and the aspect-corrected cull bounds, so they have to be the real
@@ -1645,7 +1645,14 @@ int GR_InitialiseGLExt()
  * window. ES and ANGLE keep their existing path. */
 static int GR_SceneAlwaysOffscreen(void)
 {
+#if defined(PSYX_VITA)
+	/* First asked from GR_InitialiseRender, before the context exists and
+	 * g_grIsGLES is known: it answered "desktop GL", made a target before
+	 * vglInit, and that target then blocked render_scale. */
+	return 0;
+#else
 	return g_grActiveBackend == PSYX_BACKEND_GL && !g_grIsGLES;
+#endif
 }
 
 extern "C" void GR_ApplyPresentSize(int realW, int realH)
@@ -1855,7 +1862,10 @@ void GR_Shutdown()
 
 void GR_UpdateSwapIntervalState(int swapInterval)
 {
-#if defined(RENDERER_OGL)
+	/* Vita too: vitaGL starts with its vblank wait ON, and while this was
+	 * desktop-only the config's vsync = 0 never reached it -- the swap waited
+	 * ~2 vblanks (36 ms) on top of the game's own 30 fps pacing. */
+#if defined(RENDERER_OGL) || defined(PSYX_VITA)
 	/* Only on a change. This runs every frame from PsyX_BeginScene, and SDL
 	 * hands every call straight to wglSwapIntervalEXT / eglSwapInterval, which
 	 * on NVIDIA's DXGI-layered OpenGL present reconfigures presentation even
