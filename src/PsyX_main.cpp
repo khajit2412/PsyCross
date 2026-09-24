@@ -1119,6 +1119,10 @@ uint PsyX_CalcFPS();
 extern "C" void (*g_PsyX_PostCaptureHook)(void) = NULL;
 
 #if defined(__vita__)
+extern "C" unsigned long long g_splitUs[4];
+#endif
+
+#if defined(__vita__)
 /* Where PsyX_EndScene's time goes on Vita (it was 32-38 ms/frame with the GPU
  * at ~70%): stage totals in microseconds, reported every 300 frames. */
 static Uint64 s_esUs[6];
@@ -1213,6 +1217,12 @@ void PsyX_EndScene()
 		eprintf("[GLCOUNT] per frame: fboBind=%.1f clear=%.1f readPixels=%.1f copyTex=%.1f texUpload=%.1f draws=%.1f\n",
 		        g_vitaGlCount[VGLC_FBO] / n, g_vitaGlCount[VGLC_CLEAR] / n, g_vitaGlCount[VGLC_READ] / n,
 		        g_vitaGlCount[VGLC_COPYTEX] / n, g_vitaGlCount[VGLC_TEXUP] / n, g_vitaGlCount[VGLC_DRAW] / n);
+		{
+			eprintf("[SPLITS] ms/frame: texture+shader=%.2f clip+viewport=%.2f blend/stencil/depth=%.2f draw=%.2f\n",
+			        g_splitUs[0] / n / 1000.0, g_splitUs[1] / n / 1000.0,
+			        g_splitUs[2] / n / 1000.0, g_splitUs[3] / n / 1000.0);
+			memset(g_splitUs, 0, sizeof(g_splitUs));
+		}
 		memset(s_esUs, 0, sizeof(s_esUs));
 		memset(g_vitaGlCount, 0, sizeof(g_vitaGlCount));
 		s_esFrames = 0;

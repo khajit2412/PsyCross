@@ -2985,6 +2985,17 @@ int g_PsxWorldDepthAlways = 1;
 
 int g_PsxDbgAddMode = 1;
 
+#if defined(__vita__)
+#include <psp2/kernel/processmgr.h>
+/* Microseconds per part of a draw split on Vita: texture/shader, clip and
+ * offscreen state, the other state setters, the draw call. Reported with
+ * [ENDSCENE] by PsyX_EndScene. */
+extern "C" { unsigned long long g_splitUs[4]; }
+#define SPLIT_T() sceKernelGetProcessTimeWide()
+#else
+#define SPLIT_T() 0ULL
+#endif
+
 void DrawSplit(const GPUDrawSplit& split)
 {
 	const bool isAdditive = (split.blendMode == BM_ADD || split.blendMode == BM_ADD_QUATER_SOURCE);
@@ -3011,8 +3022,10 @@ void DrawSplit(const GPUDrawSplit& split)
 	if(split.debugText)
 		GR_PushDebugLabel(split.debugText);
 
+	unsigned long long t0 = SPLIT_T();
 	GR_SetStencilMode(split.drawPrimMode);	// draw with mask 0x16
 
+	unsigned long long t1 = SPLIT_T();
 	GR_SetTexture(split.textureId, split.texFormat);
 
 	if (split.texFormat == TF_32_BIT_RGBA)
@@ -3020,10 +3033,12 @@ void DrawSplit(const GPUDrawSplit& split)
 		                          split.drawenv.tw.x, split.drawenv.tw.y,
 		                          split.overrideHiresW, split.overrideHiresH);
 
+	unsigned long long t2 = SPLIT_T();
 	const bool drawOnScreen = split.drawenv.dfe;
 	GR_SetupClipMode(&split.drawenv.clip, drawOnScreen);
 	GR_SetOffscreenState(&split.drawenv.clip, !drawOnScreen);
 
+	unsigned long long t3 = SPLIT_T();
 	GR_SetBlendMode(split.blendMode);
 
 	/* PGXP coplanar fix (docs/PGXP_PR51_Vetting.md): draw static-world opaque
@@ -3054,7 +3069,20 @@ void DrawSplit(const GPUDrawSplit& split)
 		                        (int)split.numVerts, (int)split.drawenv.dfe);
 	}
 
+	unsigned long long t4 = SPLIT_T();
 	GR_DrawTriangles(split.startVertex, split.numVerts / 3);
+
+#if defined(__vita__)
+	{
+		const unsigned long long t5 = SPLIT_T();
+		g_splitUs[0] += t2 - t1;
+		g_splitUs[1] += t3 - t2;
+		g_splitUs[2] += (t1 - t0) + (t4 - t3);
+		g_splitUs[3] += t5 - t4;
+	}
+#else
+	(void)t0; (void)t1; (void)t2; (void)t3; (void)t4;
+#endif
 
 	if (split.debugText)
 		GR_PopDebugLabel();

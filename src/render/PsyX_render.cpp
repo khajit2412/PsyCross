@@ -253,6 +253,11 @@ int g_PreviousDepthMode = 0;
 int g_PreviousDepthFuncAlways = 0; /* 0 = glDepthFunc(GL_LEQUAL) (init default), 1 = GL_ALWAYS */
 int g_PreviousStencilMode = 0;
 int g_PreviousScissorState = 0;
+#if defined(PSYX_VITA) && USE_OPENGL
+/* Per-program projection cache, see GR_UniformMatrixCached. */
+static struct { ShaderID prog; GLint loc; float m[16]; } s_matCache[16];
+static int s_matCacheCount;
+#endif
 int g_PreviousOffscreenState = 0;
 RECT16 g_PreviousFramebuffer = { 0,0,0,0 };
 /* PC port: nonzero once GR_StoreFrameBuffer has stored at least one frame in
@@ -316,6 +321,10 @@ void GR_ApplyRenderScale(void)
 
 	if (s <= 0.0f || s > 1.0f)
 		s = 1.0f;
+#if defined(PSYX_VITA)
+	/* Already applied as the display mode (vita_sdlgl_shim.c). */
+	s = 1.0f;
+#endif
 
 	/* Present size first: this is also where borderless decides whether it wants
 	 * the internal target for its own chosen resolution. If it took it, leave it
@@ -3081,6 +3090,9 @@ ShaderID GR_Shader_Compile(const char* source)
 	const char* fs_list[] = { GLSL_HEADER_FRAG, extra_fs_defines, source };
 
 	GLuint program = glCreateProgram();
+#if defined(PSYX_VITA)
+	s_matCacheCount = 0;
+#endif
 
 	{
 		GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
@@ -3492,6 +3504,45 @@ int GR_InitialisePSX()
 	return 1;
 }
 
+#if defined(PSYX_VITA) && USE_OPENGL
+/* GR_SetOffscreenState re-sends the projection on every split. Uniform values
+ * belong to the program, so an identical matrix for the same program is
+ * skipped. Cleared by GR_Shader_Compile, since a new program can reuse an id. */
+
+static void GR_UniformMatrixCached(GLint loc, const float* m)
+{
+	int i;
+
+	if (loc == -1)
+		return;
+	if (g_PreviousShader == (ShaderID)-1)
+	{
+		glUniformMatrix4fv(loc, 1, GL_FALSE, m);
+		return;
+	}
+	for (i = 0; i < s_matCacheCount; i++)
+	{
+		if (s_matCache[i].prog == g_PreviousShader && s_matCache[i].loc == loc)
+		{
+			if (memcmp(s_matCache[i].m, m, sizeof(s_matCache[i].m)) == 0)
+				return;
+			break;
+		}
+	}
+	if (i == s_matCacheCount)
+	{
+		if (s_matCacheCount == (int)(sizeof(s_matCache) / sizeof(s_matCache[0])))
+			i = 0;
+		else
+			s_matCacheCount++;
+		s_matCache[i].prog = g_PreviousShader;
+		s_matCache[i].loc  = loc;
+	}
+	memcpy(s_matCache[i].m, m, sizeof(s_matCache[i].m));
+	glUniformMatrix4fv(loc, 1, GL_FALSE, m);
+}
+#endif
+
 void GR_Ortho2D(float left, float right, float bottom, float top, float znear, float zfar)
 {
 	float a = 2.0f / (right - left);
@@ -3513,7 +3564,9 @@ void GR_Ortho2D(float left, float right, float bottom, float top, float znear, f
 		x, y, z, 1
 	};
 
-#if USE_OPENGL
+#if defined(PSYX_VITA) && USE_OPENGL
+	GR_UniformMatrixCached(u_projectionLoc, ortho);
+#elif USE_OPENGL
 	glUniformMatrix4fv(u_projectionLoc, 1, GL_FALSE, ortho);
 #endif
 }
@@ -3534,7 +3587,9 @@ void GR_Perspective3D(const float fov, const float width, const float height, co
 		0, 0, -(2 * zFar * zNear) / (zFar - zNear), 0
 	};
 
-#if USE_OPENGL
+#if defined(PSYX_VITA) && USE_OPENGL
+	GR_UniformMatrixCached(u_projection3DLoc, persp);
+#elif USE_OPENGL
 	glUniformMatrix4fv(u_projection3DLoc, 1, GL_FALSE, persp);
 #endif
 }
