@@ -549,7 +549,14 @@ static void GR_ApplyTextureFilter(TextureID tex, TexFormat texFormat)
  * PsyX_GPU/PsyX_GTE cannot drift apart. */
 extern "C" int GR_NeedViewSpaceData(void)
 {
+#if defined(PSYX_VITA)
+	/* Per-vertex hashing into the view-space table is real CPU on Vita and
+	 * scales with vertices (a character on screen cost several ms), so only
+	 * while the beam is lit -- the lean shaders read nothing from it. */
+	return ((g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive) || g_PsxUsePgxp || g_cfg_textureFilter > 0) ? 1 : 0;
+#else
 	return (g_PsyX_UsePerPixelFlashlight || g_PsxUsePgxp || g_cfg_textureFilter > 0) ? 1 : 0;
+#endif
 }
 /* 1 = bilinear-filter menu / 2D-only frames (those set g_PsxDitherSuppressed),
  * independent of the 3D psx_dither setting. Passed to the sampler as bilinearFilter==2. */
@@ -2023,6 +2030,12 @@ GTEShader g_gte_shader_8;
 GTEShader g_gte_shader_16;
 GTEShader g_gte_shader_32_rgba;
 GTEShader g_modern_shader_4, g_modern_shader_8, g_modern_shader_16, g_modern_shader_32_rgba;
+#if defined(PSYX_VITA)
+/* Same sources without the per-pixel flashlight/shadow tail, used while the
+ * flashlight is not lit (the case u_flashlightOn == 0 already skipped). */
+GTEShader g_lean_shader_4, g_lean_shader_8, g_lean_shader_16, g_lean_shader_32_rgba;
+static int s_compileNoFlashlight = 0;
+#endif
 
 #if USE_OPENGL
 
@@ -2546,6 +2559,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	 * are byte-identical. */\
 	"		if (u_untextured > 0) flAlbedo = fragColor.rgb;\n"\
 	/* Two flashlight styles, chosen by the UNIFORM u_flStyle (uniform control flow, so derivative use inside the branch is well-defined). 1 = CLASSIC: PSX-calibrated orientation-independent overlay -- no face normals, func_80057658-derived falloff, eased wide cone, 0.49 base dim. 0 = MODERN: stylized spotlight -- per-fragment Lambert from a dFdx/dFdy-reconstructed face normal, linear falloff, hard 0.15 dark surround. */\
+	"#ifndef PSYX_NO_FLASHLIGHT\n"\
 	"		if (u_flashlightOn > 0) {\n"\
 	"			vec3 flP = v_viewpos;\n"\
 	"			if (flP.z > 0.0) {\n"\
@@ -2632,6 +2646,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"				fragColor.rgb += flAlbedo * fl * (1.0 - clamp(v_fade, 0.0, 1.0));\n"\
 	"			}\n"\
 	"		}\n"\
+	"#endif\n"\
 	"		float fogAmt = clamp(v_fogAmount * u_fogStrength, 0.0, 1.0);\n"\
 	/* Plain PSX fog: the ramp reaches full fog at the map's fog distance and the
 	 * world is culled on its nearest vertex past it, so nothing drawn sits short
@@ -2666,11 +2681,15 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	/* bilinearFilter is the GATE (0 = off, 1 = 3D geometry only, 2 = this whole
 	 * frame); u_anisoTaps chooses HOW to filter once it passes. Keeping the two
 	 * separate is why anisotropic needs no new gate logic. */\
+	"#ifdef PSYX_NO_TEXFILTER\n"\
+	"		fragColor = NearestTextureSample(v_texcoord.xy);\n"\
+	"#else\n"\
 	"		if((bilinearFilter == 1 && v_geom3d > 0.5) || bilinearFilter >= 2)\n"\
 	"			fragColor = (u_anisoTaps > 1.0) ? AnisoTextureSample(v_texcoord.xy)\n"\
 	"			                                : BilinearTextureSample(v_texcoord.xy);\n"\
 	"		else\n"\
 	"			fragColor = NearestTextureSample(v_texcoord.xy);\n"\
+	"#endif\n"\
 	/* Untextured prims bind a 1x1 white placeholder, which decodes through the
 	 * 5-bit table like any VRAM texel: 0xFFFF -> 248/256, so every flat or
 	 * gouraud prim drew at 31/32 of its vertex colour. PSX draws them at the
@@ -3076,6 +3095,15 @@ ShaderID GR_Shader_Compile(const char* source)
 #else
 	strcat(extra_vs_defines, "#define PAGE_CLUT_VARYING AFFINE_VARYING\n");
 	strcat(extra_fs_defines, "#define PAGE_CLUT_VARYING AFFINE_VARYING\n");
+#if defined(PSYX_VITA)
+	/* The GPU budgets registers for the worst path in the program, taken or
+	 * not, so unused features still cost fill rate. Filtering is compiled in
+	 * only if configured at startup; the no-flashlight set is its own program. */
+	if (g_cfg_textureFilter <= 0)
+		strcat(extra_fs_defines, "#define PSYX_NO_TEXFILTER\n");
+	if (s_compileNoFlashlight)
+		strcat(extra_fs_defines, "#define PSYX_NO_FLASHLIGHT\n");
+#endif
 #endif
 
 	{
@@ -3323,6 +3351,14 @@ void GR_InitialisePSXShaders()
 	GR_CompilePSXShader(&g_gte_shader_8, gte_shader_8);
 	GR_CompilePSXShader(&g_gte_shader_16, gte_shader_16);
 	GR_CompilePSXShader(&g_gte_shader_32_rgba, gte_shader_32_rgba);
+#if defined(PSYX_VITA)
+	s_compileNoFlashlight = 1;
+	GR_CompilePSXShader(&g_lean_shader_4, gte_shader_4);
+	GR_CompilePSXShader(&g_lean_shader_8, gte_shader_8);
+	GR_CompilePSXShader(&g_lean_shader_16, gte_shader_16);
+	GR_CompilePSXShader(&g_lean_shader_32_rgba, gte_shader_32_rgba);
+	s_compileNoFlashlight = 0;
+#endif
 	Pc_ModernShader_Initialise(gte_shader_4, gte_shader_8, gte_shader_16, gte_shader_32_rgba);
 	GR_InitialisePSXShader(&g_modern_shader_4, Pc_ModernShader_Get(TF_4_BIT));
 	GR_InitialisePSXShader(&g_modern_shader_8, Pc_ModernShader_Get(TF_8_BIT));
@@ -4101,6 +4137,17 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 void GR_SetTexture(TextureID texture, TexFormat texFormat)
 {
 	GTEShader* shader;
+#if defined(PSYX_VITA)
+	if (!(g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive))
+	{
+		if (texFormat == TF_4_BIT) shader = &g_lean_shader_4;
+		else if (texFormat == TF_8_BIT) shader = &g_lean_shader_8;
+		else if (texFormat == TF_16_BIT) shader = &g_lean_shader_16;
+		else shader = &g_lean_shader_32_rgba;
+		GR_SetTextureShader(texture, texFormat, shader);
+		return;
+	}
+#endif
 	if (texFormat == TF_4_BIT) shader = &g_gte_shader_4;
 	else if (texFormat == TF_8_BIT) shader = &g_gte_shader_8;
 	else if (texFormat == TF_16_BIT) shader = &g_gte_shader_16;

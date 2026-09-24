@@ -281,6 +281,11 @@ static void PsyX_Pad_DumpDeviceDetail(SDL_GameController* gc)
 	{
 		SDL_GameControllerButtonBind b =
 			SDL_GameControllerGetBindForButton(gc, (SDL_GameControllerButton)i);
+#if defined(__vita__)
+		/* The Vita build uses 4-byte enums, vitasdk's SDL one byte: only the low
+		 * byte of bindType was written by the library. */
+		b.bindType = (SDL_GameControllerBindType)((int)b.bindType & 0xFF);
+#endif
 
 		if (b.bindType == SDL_CONTROLLER_BINDTYPE_BUTTON)
 			eprintinfo("[PADINFO] '%s' <- raw button %d%s",

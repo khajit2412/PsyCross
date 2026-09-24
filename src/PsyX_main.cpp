@@ -238,11 +238,41 @@ int intrThreadMain(void* data)
 	 * Target 7328 → fires at 4233600/7328 ≈ 577.8 Hz → ~1.73ms period */
 	const double rcnt2Period = 1.0 / 577.8;
 
+#if defined(__vita__)
+	/* Once this thread sleeps it only runs when the main thread leaves its
+	 * core, and "one vblank per wake-up, then reset" turned every late wake-up
+	 * into drift: vblanks came at ~43 Hz, so the game both waited longer and
+	 * paced itself slower. Higher priority to preempt, and the count comes from
+	 * elapsed time (as the Emscripten path already does). */
+	SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+	int vblDone = 0;
+#endif
+
 	while (!g_stopIntrThread)
 	{
 		// step counters
 		{
 			const double timestep = g_vmode == MODE_NTSC ? FIXED_TIME_STEP_NTSC : FIXED_TIME_STEP_PAL;
+#if defined(__vita__)
+			const int vblDue = (int)(Util_GetHPCTime(&g_vblTimer, 0) / timestep);
+
+			/* After a long stall (a load) jump ahead instead of firing a burst. */
+			if (vblDue - vblDone > 30)
+				vblDone = vblDue - 1;
+
+			while (vblDone < vblDue)
+			{
+				SDL_LockMutex(g_intrMutex);
+
+				if (vsync_callback)
+					vsync_callback();
+
+				SDL_UnlockMutex(g_intrMutex);
+
+				g_psxSysCounters[PsxCounter_VBLANK]++;
+				vblDone++;
+			}
+#else
 			const double vblDelta = Util_GetHPCTime(&g_vblTimer, 0);
 
 			if (vblDelta > timestep)
@@ -259,6 +289,7 @@ int intrThreadMain(void* data)
 
 				Util_GetHPCTime(&g_vblTimer, 1);
 			}
+#endif
 
 			/* Pump RCnt2 timer for BGM/MIDI sequencer */
 			if (g_rcnt2_timer_active)
@@ -987,7 +1018,12 @@ void PsyX_Sys_DoPollEvent()
 			case SDL_KEYDOWN:
 			case SDL_KEYUP:
 			{
+#if defined(__vita__)
+				/* 4-byte enums here, 2-byte SDL_Scancode in vitasdk's SDL. */
+				int nKey = (int)event.key.keysym.scancode & 0xFFFF;
+#else
 				int nKey = event.key.keysym.scancode;
+#endif
 
 				if (nKey == SDL_SCANCODE_RETURN)
 				{
