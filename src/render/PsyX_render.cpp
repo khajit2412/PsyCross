@@ -2487,6 +2487,22 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"		v_shadowViewPos = vec4(a_viewpos * shadowInvZ, shadowInvZ) * shadowClipW;\n"\
 	"	}\n"
 
+/* Vita draw batching (DrawAllSplits): an untextured prim merged into a VRAM
+ * split is marked by impossible UV bounds (ulo > uhi) instead of binding the
+ * white placeholder. The white texel decoded to lut((1,1)) in every format --
+ * texel and CLUT both read white -- with the colour then forced to 1, so that
+ * is exactly what the marked prim outputs, unsampled and never discarded. */
+#if defined(PSYX_VITA)
+#	define GPU_UNTEX_VERTEX "v_uvlim.x > v_uvlim.z"
+#	define GPU_UNTEX_BEGIN\
+	"		if (v_uvlim.x > v_uvlim.z) { fragColor = vec4(1.0, 1.0, 1.0, lut(vec2(1.0)).a); } else {\n"
+#	define GPU_UNTEX_END "		}\n"
+#else
+#	define GPU_UNTEX_VERTEX "false"
+#	define GPU_UNTEX_BEGIN ""
+#	define GPU_UNTEX_END ""
+#endif
+
 /* Vita has no depth textures: the shadow map is window depth packed into
  * RGBA8 by s_shadowDepthShaderSrc, unpacked here. */
 #if defined(PSYX_VITA)
@@ -2557,7 +2573,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	 * to the light). Use the vertex-lit color as the albedo instead — bounded
 	 * by what the surface actually looks like. Textured splits (u_untextured=0)
 	 * are byte-identical. */\
-	"		if (u_untextured > 0) flAlbedo = fragColor.rgb;\n"\
+	"		if (u_untextured > 0 || " GPU_UNTEX_VERTEX ") flAlbedo = fragColor.rgb;\n"\
 	/* Two flashlight styles, chosen by the UNIFORM u_flStyle (uniform control flow, so derivative use inside the branch is well-defined). 1 = CLASSIC: PSX-calibrated orientation-independent overlay -- no face normals, func_80057658-derived falloff, eased wide cone, 0.49 base dim. 0 = MODERN: stylized spotlight -- per-fragment Lambert from a dFdx/dFdy-reconstructed face normal, linear falloff, hard 0.15 dark surround. */\
 	"#ifndef PSYX_NO_FLASHLIGHT\n"\
 	"		if (u_flashlightOn > 0) {\n"\
@@ -2681,6 +2697,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	/* bilinearFilter is the GATE (0 = off, 1 = 3D geometry only, 2 = this whole
 	 * frame); u_anisoTaps chooses HOW to filter once it passes. Keeping the two
 	 * separate is why anisotropic needs no new gate logic. */\
+	GPU_UNTEX_BEGIN\
 	"#ifdef PSYX_NO_TEXFILTER\n"\
 	"		fragColor = NearestTextureSample(v_texcoord.xy);\n"\
 	"#else\n"\
@@ -2690,6 +2707,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"		else\n"\
 	"			fragColor = NearestTextureSample(v_texcoord.xy);\n"\
 	"#endif\n"\
+	GPU_UNTEX_END\
 	/* Untextured prims bind a 1x1 white placeholder, which decodes through the
 	 * 5-bit table like any VRAM texel: 0xFFFF -> 248/256, so every flat or
 	 * gouraud prim drew at 31/32 of its vertex colour. PSX draws them at the
@@ -2698,7 +2716,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	 * void came out (107,99,114) against fully fogged geometry at the exact fog
 	 * colour (108,100,116), so every building, tree and post stood out from it.
 	 * Alpha is kept, since it carries the semi-transparency. */\
-	"		if (u_untextured > 0) fragColor.rgb = vec3(1.0);\n"\
+	"		if (u_untextured > 0 || " GPU_UNTEX_VERTEX ") fragColor.rgb = vec3(1.0);\n"\
 	/* Additive and subtractive prims fade their edges by texture coverage.
 	 * TapWeighted divides the filtered colour by the OPAQUE tap weight, so a
 	 * fragment with one opaque tap out of four comes out at full brightness and
@@ -6363,7 +6381,12 @@ static void GR_EnsureFbPackTarget(int w, int h)
 		glGenVertexArrays(1, &g_fbPackVAO);
 #if defined(PSYX_VITA)
 		{
-			static const float kTri[6] = { -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f };
+			/* An exact quad, not the oversize triangle: GXM does not clip to the
+			 * viewport, and the triangle's overhang past the rect packed smeared
+			 * capture edges into the neighbouring VRAM -- the font rows at
+			 * y 496-511 below buffer 1 among them (the "barcode" text). */
+			static const float kTri[12] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
+			                                -1.0f,  1.0f, 1.0f, -1.0f,  1.0f, 1.0f };
 			GLuint vbo;
 			GLint  prevBuf = 0;
 			glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
@@ -6441,7 +6464,11 @@ static void GR_PackFrameToVramRectGain(int x, int y, int w, int h, float gain)
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, g_fbPackTex);
 	glBindVertexArray(g_fbPackVAO);
+#if defined(PSYX_VITA)
+	glDrawArrays(GL_TRIANGLES, 0, 6);
+#else
 	glDrawArrays(GL_TRIANGLES, 0, 3);
+#endif
 	glBindVertexArray(0);
 
 	glEnable(GL_STENCIL_TEST);
@@ -6491,6 +6518,60 @@ static void GR_PackFrameToAllFeedbackRects(void)
 /* Stamp a VRAM rect to packed word 0 (RG = 0,0), which the samplers treat as
  * texel-0 = transparent (discard). Used to blank the feedback rects when the
  * loading blur is not active, so the per-map overlay samplers draw nothing. */
+#if defined(PSYX_VITA) && USE_OPENGL
+/* vitaGL builds the scissor partly from a depth mask, and with depth testing
+ * off (as here) a scissored glClear on the VRAM target cleared far more than
+ * the rect -- fonts and sign textures went with it. The viewport maps a
+ * full-NDC quad exactly onto the rect instead, with no scissor involved. */
+static ShaderID s_vitaZeroShader = (ShaderID)-1;
+static GLuint   s_vitaZeroVAO = 0;
+
+static void GR_VitaZeroRect(int x, int y, int w, int h)
+{
+	GLint prevBuf = 0, vp[4];
+
+	if (s_vitaZeroShader == (ShaderID)-1)
+	{
+		static const char* src =
+			"#ifdef VERTEX\n"
+			"attribute vec2 a_position;\n"
+			"void main() { gl_Position = vec4(a_position, 0.0, 1.0); }\n"
+			"#else\n"
+			"void main() { fragColor = vec4(0.0); }\n"
+			"#endif\n";
+		static const float quad[8] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f };
+		GLuint vbo;
+
+		s_vitaZeroShader = GR_Shader_Compile(src);
+		glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
+		glGenVertexArrays(1, &s_vitaZeroVAO);
+		glBindVertexArray(s_vitaZeroVAO);
+		glGenBuffers(1, &vbo);
+		glBindBuffer(GL_ARRAY_BUFFER, vbo);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+		glEnableVertexAttribArray(a_position);
+		glVertexAttribPointer(a_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+		glBindVertexArray(0);
+		glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevBuf);
+	}
+
+	glGetIntegerv(GL_VIEWPORT, vp);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_BLEND);
+	glViewport(x, y, w, h);
+	glUseProgram(s_vitaZeroShader);
+	glBindVertexArray(s_vitaZeroVAO);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glBindVertexArray(0);
+	glViewport(vp[0], vp[1], vp[2], vp[3]);
+	glEnable(GL_STENCIL_TEST);
+	g_PreviousShader      = (ShaderID)-1;
+	g_PreviousStencilMode = -999;
+}
+#endif
+
 static void GR_ClearVramRect(int x, int y, int w, int h)
 {
 #if USE_OPENGL
@@ -6504,6 +6585,10 @@ static void GR_ClearVramRect(int x, int y, int w, int h)
 	glBindFramebuffer(GL_FRAMEBUFFER, g_glVRAMFramebuffer);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_vramTexture, 0);
 
+#if defined(PSYX_VITA)
+	(void)cc;
+	GR_VitaZeroRect(x, y, w, h);
+#else
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_BLEND);
 	glEnable(GL_SCISSOR_TEST);
@@ -6512,6 +6597,7 @@ static void GR_ClearVramRect(int x, int y, int w, int h)
 	glClear(GL_COLOR_BUFFER_BIT);
 	glDisable(GL_SCISSOR_TEST);
 	glClearColor(cc[0], cc[1], cc[2], cc[3]);
+#endif
 
 	/* [FBCLEAR] one-shot proof the blank reached the SAMPLED texture (the
 	 * ANGLE rainbow diagnosis): FBO status + a readback of the rect's first
@@ -6555,9 +6641,110 @@ static void GR_ClearAllFeedbackRects(void)
  * PSX coordinate (u,v) of the display buffer lands on texel (u,v). Shared by the
  * per-present feedback store and the mid-frame scene-scratch capture; see the
  * g_psxAreaVp note below for why the source rect is not simply the viewport. */
+#if defined(PSYX_VITA) && USE_OPENGL
+/* vitaGL does not scale in glBlitFramebuffer (the render_scale stretch put the
+ * scene in a corner), so the screen region is copied 1:1 into a scratch texture
+ * and drawn as a quad into the pack target, which does the downscale. */
+static GLuint   s_vitaCapTex = 0;
+static int      s_vitaCapW = 0, s_vitaCapH = 0;
+static ShaderID s_vitaBlitShader = (ShaderID)-1;
+static GLuint   s_vitaBlitVAO = 0, s_vitaBlitVBO = 0;
+
+static const char* s_vitaBlitShaderSrc =
+	"varying vec2 v_uv;\n"
+	"#ifdef VERTEX\n"
+	"attribute vec2 a_position;\n"
+	"attribute vec2 a_texcoord;\n"
+	"void main() { v_uv = a_texcoord; gl_Position = vec4(a_position, 0.0, 1.0); }\n"
+	"#else\n"
+	"uniform sampler2D s_texture;\n"
+	"void main() { fragColor = texture2D(s_texture, v_uv); }\n"
+	"#endif\n";
+
+/* Copies window rect (sx,sy,sw,sh) of the bound framebuffer and draws it over
+ * (dx0,dy0)-(dx1,dy1) of the w x h pack target. */
+static void GR_VitaCopyScaled(int sx, int sy, int sw, int sh,
+                              int dx0, int dy0, int dx1, int dy1, int w, int h, int nearest)
+{
+	GLint prevBuf = 0;
+	float x0, y0, x1, y1;
+
+	if (sw <= 0 || sh <= 0)
+		return;
+
+	if (s_vitaBlitShader == (ShaderID)-1)
+	{
+		s_vitaBlitShader = GR_Shader_Compile(s_vitaBlitShaderSrc);
+		glUseProgram(s_vitaBlitShader);
+		{
+			GLint loc = glGetUniformLocation(s_vitaBlitShader, "s_texture");
+			if (loc != -1) glUniform1i(loc, 0);
+		}
+		glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
+		glGenVertexArrays(1, &s_vitaBlitVAO);
+		glBindVertexArray(s_vitaBlitVAO);
+		glGenBuffers(1, &s_vitaBlitVBO);
+		glBindBuffer(GL_ARRAY_BUFFER, s_vitaBlitVBO);
+		glBufferData(GL_ARRAY_BUFFER, 16 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+		glEnableVertexAttribArray(a_position);
+		glVertexAttribPointer(a_position, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), 0);
+		glEnableVertexAttribArray(a_texcoord);
+		glVertexAttribPointer(a_texcoord, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+		glBindVertexArray(0);
+		glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevBuf);
+	}
+
+	glActiveTexture(GL_TEXTURE0);
+	if (!s_vitaCapTex)
+		glGenTextures(1, &s_vitaCapTex);
+	glBindTexture(GL_TEXTURE_2D, s_vitaCapTex);
+	if (s_vitaCapW != sw || s_vitaCapH != sh)
+	{
+		s_vitaCapW = sw;
+		s_vitaCapH = sh;
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	}
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, nearest ? GL_NEAREST : GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, nearest ? GL_NEAREST : GL_LINEAR);
+
+	glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, sx, sy, sw, sh);
+
+	x0 = (float)dx0 / (float)w * 2.0f - 1.0f;
+	x1 = (float)dx1 / (float)w * 2.0f - 1.0f;
+	y0 = (float)dy0 / (float)h * 2.0f - 1.0f;
+	y1 = (float)dy1 / (float)h * 2.0f - 1.0f;
+	{
+		const float quad[16] = {
+			x0, y0, 0.0f, 0.0f,
+			x1, y0, 1.0f, 0.0f,
+			x0, y1, 0.0f, 1.0f,
+			x1, y1, 1.0f, 1.0f,
+		};
+
+		glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
+		glBindBuffer(GL_ARRAY_BUFFER, s_vitaBlitVBO);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_DYNAMIC_DRAW);
+		glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevBuf);
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, g_fbPackFBO);
+	glViewport(0, 0, w, h);
+	glDisable(GL_BLEND);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glUseProgram(s_vitaBlitShader);
+	glBindVertexArray(s_vitaBlitVAO);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glBindVertexArray(0);
+}
+#endif
+
 static void GR_CaptureFrameToPackTex(int w, int h)
 {
-#if USE_OPENGL && USE_FRAMEBUFFER_BLIT
+#if USE_OPENGL && (USE_FRAMEBUFFER_BLIT || defined(PSYX_VITA))
 	GLuint readFBO = 0;
 
 	GR_EnsureFbPackTarget(w, h);
@@ -6658,7 +6845,11 @@ static void GR_CaptureFrameToPackTex(int w, int h)
 		{
 			GLfloat cc[4];
 			glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+#if defined(PSYX_VITA)
+			glBindFramebuffer(GL_FRAMEBUFFER, g_fbPackFBO);
+#else
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_fbPackFBO);
+#endif
 			glDisable(GL_SCISSOR_TEST);
 			glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 			glClear(GL_COLOR_BUFFER_BIT);
@@ -6688,15 +6879,35 @@ static void GR_CaptureFrameToPackTex(int w, int h)
 			 * load that diffusion is a grey haze. The blending dream overlays keep
 			 * LINEAR: their loop halves every frame, so diffusion never builds. */
 			const int exact = (!g_fbSamplerSemiTrans && g_PsxFeedbackExact) ? 1 : 0;
+#if defined(PSYX_VITA)
+			GLint vp[4];
+			glGetIntegerv(GL_VIEWPORT, vp);
+			glBindFramebuffer(GL_FRAMEBUFFER, readFBO);
+			GR_VitaCopyScaled((int)(sx0 + 0.5f), (int)(sy0 + 0.5f),
+			                  (int)(sx1 + 0.5f) - (int)(sx0 + 0.5f), (int)(sy1 + 0.5f) - (int)(sy0 + 0.5f),
+			                  dx0, dy0, dx1, dy1, w, h, exact);
+			glViewport(vp[0], vp[1], vp[2], vp[3]);
+			glEnable(GL_STENCIL_TEST);
+			g_PreviousShader      = (ShaderID)-1;
+			g_lastBoundTexture    = (TextureID)-1;
+			g_PreviousBlendMode   = -999;
+			g_PreviousDepthMode   = -999;
+			g_PreviousStencilMode = -999;
+#else
 			glBindFramebuffer(GL_READ_FRAMEBUFFER, readFBO);
 			glBlitFramebuffer((int)(sx0 + 0.5f), (int)(sy0 + 0.5f),
 			                  (int)(sx1 + 0.5f), (int)(sy1 + 0.5f),
 			                  dx0, dy0, dx1, dy1,
 			                  GL_COLOR_BUFFER_BIT, exact ? GL_NEAREST : GL_LINEAR);
+#endif
 		}
 	}
+#if defined(PSYX_VITA)
+	glBindFramebuffer(GL_FRAMEBUFFER, GR_ScreenFBO());
+#else
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, GR_ScreenReadFBO());
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GR_ScreenFBO());
+#endif
 	g_PreviousScissorState = 0;
 
 	g_fbPackValid = 1;
@@ -6725,7 +6936,7 @@ static void GR_SceneRedirectTick(void)
  * feedback rects. */
 extern "C" void GR_StoreFrameBufferPsx(void)
 {
-#if USE_OPENGL && USE_FRAMEBUFFER_BLIT
+#if USE_OPENGL && (USE_FRAMEBUFFER_BLIT || defined(PSYX_VITA))
 	/* Consumed here, before any early return, so a hold set on a frame the
 	 * store stands down for cannot leak into the next frame. */
 	const int holdFrame = g_PsxFeedbackHoldFrame;
@@ -6786,7 +6997,7 @@ extern "C" void GR_StoreFrameBufferPsx(void)
  * feedback damp exists only for rects that feed on their own output. */
 extern "C" void GR_CaptureFrameToVramRect(int x, int y, int w, int h)
 {
-#if USE_OPENGL && USE_FRAMEBUFFER_BLIT
+#if USE_OPENGL && (USE_FRAMEBUFFER_BLIT || defined(PSYX_VITA))
 	/* The scene scratch-redirect is its own consumer: the game redraws this rect
 	 * with world-pass prims at PSX coordinates, so it wants the world mapping and
 	 * no widening, whatever the last display-buffer sampler happened to be. */

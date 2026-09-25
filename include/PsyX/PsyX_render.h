@@ -110,6 +110,11 @@
 #   define GL_CONSTANT_ALPHA            GL_SRC_ALPHA
 #   define GL_ONE_MINUS_CONSTANT_ALPHA  GL_ONE_MINUS_SRC_ALPHA
 
+/* ES 3.0 query vitaGL.h does not name (same value glad.h supplies game-side). */
+#   ifndef GL_VERTEX_ARRAY_BINDING
+#       define GL_VERTEX_ARRAY_BINDING      0x85B5
+#   endif
+
 /* Grey-frame / depth-bits diagnostics: PBO readback and attachment queries. */
 #   define GL_PIXEL_PACK_BUFFER         0x88EB
 #   define GL_PIXEL_PACK_BUFFER_BINDING 0x88ED

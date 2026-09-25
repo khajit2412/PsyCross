@@ -2836,6 +2836,13 @@ static int PgxpEmitPoly(GrVertex* v, int count)
 
 //------------------------------------------------------------------------------------------------------------------------
 
+#if defined(__vita__)
+/* Why each new split was started (first differing field), reported every 300
+ * frames with [ENDSCENE]: blend, format, texture, depth, primMode, clip, dfe,
+ * other. Draw calls cost ~20 us each on vitaGL, so this says what to merge. */
+extern "C" { unsigned g_splitCause[8]; }
+#endif
+
 static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_DISABLED)
 {
 	int tpage = activeDrawEnv.tpage;
@@ -2887,6 +2894,20 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 	}
 
 	curSplit.numVerts = g_vertexIndex - curSplit.startVertex;
+
+#if defined(__vita__)
+	if (curSplit.kind != GPU_SPLIT_LEGACY)                g_splitCause[7]++;
+	else if (curSplit.blendMode != blendMode)              g_splitCause[0]++;
+	else if (curSplit.texFormat != texFormat)              g_splitCause[1]++;
+	else if (curSplit.textureId != textureId)              g_splitCause[2]++;
+	else if (curSplit.depthMode != depthMode)              g_splitCause[3]++;
+	else if (curSplit.drawPrimMode != g_DrawPrimMode)      g_splitCause[4]++;
+	else if (curSplit.drawenv.clip.x != activeDrawEnv.clip.x || curSplit.drawenv.clip.y != activeDrawEnv.clip.y ||
+	         curSplit.drawenv.clip.w != activeDrawEnv.clip.w || curSplit.drawenv.clip.h != activeDrawEnv.clip.h)
+	                                                       g_splitCause[5]++;
+	else if (curSplit.drawenv.dfe != activeDrawEnv.dfe)    g_splitCause[6]++;
+	else                                                   g_splitCause[7]++;
+#endif
 
 	if (g_splitIndex + 1 >= MAX_DRAW_SPLITS)
 	{
@@ -3137,6 +3158,70 @@ static void DrawShadowCasters(const GPUDrawSplit& split)
 		GR_ShadowPassDraw(split.startVertex + runStart, split.numVerts - runStart);
 }
 
+#if defined(__vita__)
+static bool Vita_SplitKeysMatch(const GPUDrawSplit& a, const GPUDrawSplit& b)
+{
+	return a.blendMode == b.blendMode &&
+		a.normalTextureId == b.normalTextureId &&
+		a.depthMode == b.depthMode &&
+		a.drawPrimMode == b.drawPrimMode &&
+		a.drawenv.tw.x == b.drawenv.tw.x && a.drawenv.tw.y == b.drawenv.tw.y &&
+		a.drawenv.tw.w == b.drawenv.tw.w && a.drawenv.tw.h == b.drawenv.tw.h &&
+		a.drawenv.clip.x == b.drawenv.clip.x && a.drawenv.clip.y == b.drawenv.clip.y &&
+		a.drawenv.clip.w == b.drawenv.clip.w && a.drawenv.clip.h == b.drawenv.clip.h &&
+		a.drawenv.dfe == b.drawenv.dfe &&
+		a.overrideHiresW == b.overrideHiresW && a.overrideHiresH == b.overrideHiresH &&
+		a.debugText == NULL && b.debugText == NULL;
+}
+
+static void Vita_MarkUntextured(GPUDrawSplit& s, const GPUDrawSplit& vram)
+{
+	for (unsigned v = s.startVertex; v < s.startVertex + s.numVerts; v++)
+	{
+		g_vertexBuffer[v].ulo = 255;
+		g_vertexBuffer[v].uhi = 0;
+	}
+	s.textureId = g_vramTexture;
+	s.texFormat = vram.texFormat;
+}
+
+/* A draw call costs ~20 us on vitaGL and interiors issue ~800 a frame, most of
+ * them untextured prims (texture = white placeholder) interleaved with VRAM
+ * ones. Untextured prims are folded into the neighbouring VRAM split through
+ * the shader's ulo > uhi marker, then adjacent splits with equal state are
+ * joined. Order is preserved, so the result is pixel-identical. */
+static void Vita_BatchSplits()
+{
+	int out = 0;
+	for (int i = 1; i <= g_splitIndex; i++)
+	{
+		GPUDrawSplit s = g_splits[i];
+		if (s.kind == GPU_SPLIT_LEGACY && s.numVerts == 0 && s.debugText == NULL)
+			continue;
+
+		if (out > 0 && s.kind == GPU_SPLIT_LEGACY && g_splits[out].kind == GPU_SPLIT_LEGACY)
+		{
+			GPUDrawSplit& p = g_splits[out];
+			if (Vita_SplitKeysMatch(p, s) && p.startVertex + p.numVerts == s.startVertex)
+			{
+				if (s.textureId == g_whiteTexture && p.textureId == g_vramTexture && p.texFormat != TF_32_BIT_RGBA)
+					Vita_MarkUntextured(s, p);
+				else if (p.textureId == g_whiteTexture && s.textureId == g_vramTexture && s.texFormat != TF_32_BIT_RGBA)
+					Vita_MarkUntextured(p, s);
+
+				if (p.textureId == s.textureId && p.texFormat == s.texFormat)
+				{
+					p.numVerts += s.numVerts;
+					continue;
+				}
+			}
+		}
+		g_splits[++out] = s;
+	}
+	g_splitIndex = out;
+}
+#endif
+
 //
 // Draws all polygons after AggregatePTAG
 //
@@ -3167,6 +3252,10 @@ void DrawAllSplits()
 		PsyX_UpdateInput();
 	}
 #endif // _DEBUG
+
+#if defined(__vita__)
+	Vita_BatchSplits();
+#endif
 
 	// next code ideally should be called before EndScene
 	GR_UpdateVertexBuffer(g_vertexBuffer, g_vertexIndex);

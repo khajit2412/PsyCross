@@ -1156,6 +1156,7 @@ extern "C" void (*g_PsyX_PostCaptureHook)(void) = NULL;
 
 #if defined(__vita__)
 extern "C" unsigned long long g_splitUs[4];
+extern "C" unsigned g_splitCause[8];
 #endif
 
 #if defined(__vita__)
@@ -1258,6 +1259,10 @@ void PsyX_EndScene()
 			        g_splitUs[0] / n / 1000.0, g_splitUs[1] / n / 1000.0,
 			        g_splitUs[2] / n / 1000.0, g_splitUs[3] / n / 1000.0);
 			memset(g_splitUs, 0, sizeof(g_splitUs));
+			eprintf("[SPLITCAUSE] per frame: blend=%.1f format=%.1f texture=%.1f depth=%.1f primMode=%.1f clip=%.1f dfe=%.1f other=%.1f\n",
+			        g_splitCause[0] / n, g_splitCause[1] / n, g_splitCause[2] / n, g_splitCause[3] / n,
+			        g_splitCause[4] / n, g_splitCause[5] / n, g_splitCause[6] / n, g_splitCause[7] / n);
+			memset(g_splitCause, 0, sizeof(g_splitCause));
 		}
 		memset(s_esUs, 0, sizeof(s_esUs));
 		memset(g_vitaGlCount, 0, sizeof(g_vitaGlCount));
