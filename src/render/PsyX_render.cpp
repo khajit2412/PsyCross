@@ -276,6 +276,9 @@ TextureID g_fbTexture = -1;
 TextureID g_offscreenRTTexture = -1;
 
 TextureID g_whiteTexture = -1;
+#if defined(PSYX_VITA)
+extern "C" void GR_VitaPalCacheFrame(void);
+#endif
 TextureID g_rgLutTexture = -1;
 TextureID g_lastBoundTexture = -1;
 
@@ -1903,6 +1906,9 @@ void GR_UpdateSwapIntervalState(int swapInterval)
 void GR_BeginScene()
 {
 	g_lastBoundTexture = 0;
+#if defined(PSYX_VITA)
+	GR_VitaPalCacheFrame();
+#endif
 
 #if USE_OPENGL
 #ifdef RENDERER_OGLES
@@ -2035,6 +2041,13 @@ GTEShader g_modern_shader_4, g_modern_shader_8, g_modern_shader_16, g_modern_sha
  * flashlight is not lit (the case u_flashlightOn == 0 already skipped). */
 GTEShader g_lean_shader_4, g_lean_shader_8, g_lean_shader_16, g_lean_shader_32_rgba;
 static int s_compileNoFlashlight = 0;
+#if defined(PSYX_VITA)
+/* No-discard variants for textures with no transparent texel: a discard
+ * anywhere in a shader turns off the PowerVR's hidden-surface removal for
+ * everything it draws, so every overdrawn world pixel was fully shaded. */
+GTEShader g_lean_shader_32_opaque, g_gte_shader_32_opaque;
+static int s_compileOpaque = 0;
+#endif
 #endif
 
 #if USE_OPENGL
@@ -2129,6 +2142,19 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 #define GPU_PACK_RG_FUNC\
 	"	uniform sampler2D s_rgLut;\n"
 
+#if defined(PSYX_VITA)
+/* The table read is a random-access fetch from a 256 KB linear texture, the
+ * costliest of the three dependent reads per CLUT texel on the Vita GPU. The
+ * same bit math GR_InitRG8LUT bakes, in highp float, gives identical values. */
+#define GPU_DECODE_RG_FUNC\
+	"	vec4 lut(vec2 rg) {\n"\
+	"		vec2 b = floor(rg * 255.0 + 0.5);\n"\
+	"		float g5 = floor(b.x / 32.0) + mod(b.y, 4.0) * 8.0;\n"\
+	"		float b5 = mod(floor(b.y / 4.0), 32.0);\n"\
+	"		vec3 c = vec3(mod(b.x, 32.0), g5, b5) * (8.0 / 256.0);\n"\
+	"		return vec4(c, (rg.x + rg.y == 0.0) ? 0.0 : (b.y >= 128.0 ? 0.5 : 1.0));\n"\
+	"	}\n"
+#else
 #define GPU_DECODE_RG_FUNC\
 	"	vec4 lut(vec2 rg) {\n"\
 	"		vec2 idx = (floor(rg * 255.0 + 0.5) + 0.5) * (1.0 / 256.0);\n"\
@@ -2136,6 +2162,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"		vec3 c = floor(t.rgb * 255.0 + 0.5) * (1.0 / 256.0);\n"\
 	"		return vec4(c, (rg.x + rg.y == 0.0) ? 0.0 : (t.w > 0.25 ? 0.5 : 1.0));\n"\
 	"	}\n"
+#endif
 
 #if defined(RENDERER_OGL) || (OGLES_VERSION == 3)
 
@@ -2497,7 +2524,12 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 #	define GPU_UNTEX_BEGIN\
 	"		if (v_uvlim.x > v_uvlim.z) { fragColor = vec4(1.0, 1.0, 1.0, lut(vec2(1.0)).a); } else {\n"
 #	define GPU_UNTEX_END "		}\n"
+/* The same marker in the RGBA path, which cached palette textures draw with:
+ * white, alpha 0.5 -- what the white placeholder's 0xFFFF decoded to. */
+#	define GPU_UNTEX32_BEGIN\
+	"		if (v_uvlim.x > v_uvlim.z) { fragColor = vec4(1.0, 1.0, 1.0, 0.5); } else {\n"
 #else
+#	define GPU_UNTEX32_BEGIN ""
 #	define GPU_UNTEX_VERTEX "false"
 #	define GPU_UNTEX_BEGIN ""
 #	define GPU_UNTEX_END ""
@@ -2855,17 +2887,21 @@ const char* gte_shader_32_rgba =
 	 * level, or a minified HD atlas would still blur in through the mip chain. A
 	 * native-res replacement already lands on the texel centre (u_hiresHalf == 0.5),
 	 * so it comes out bit-identical either way. */
+	GPU_UNTEX32_BEGIN\
 	"		if (bilinearFilter == 0 || (bilinearFilter == 1 && v_geom3d < 0.5)) {\n"\
 	GPU_HIRES_POINT_SAMPLE\
 	"		} else {\n"\
 	"			fragColor = texture2D(s_texture, tc);\n"\
 	"		}\n"\
+	GPU_UNTEX_END\
 	/* PSX colour-0 transparency for hi-res overrides: alpha 0 texels are
 	 * holes on ANY prim (opaque prims ignore blending, so without the
 	 * discard they'd render solid). 0.5 cutoff keeps authored soft-alpha
 	 * edges blending on semi-transparent prims while opaque cutouts
 	 * (foliage/UI) stay clean. */
+	"#ifndef PSYX_OPAQUE_TEX\n"\
 	"		if (fragColor.a < 0.5) discard;\n"\
+	"#endif\n"\
 	/* Per-prim alpha fade (v_color.a, default 1.0 -- see
 	 * PsyX_SetNextPrimAlpha). BM_AVERAGE is genuine SRC_ALPHA blending on
 	 * PC, so scaling the surviving texels' alpha is a true transparency
@@ -3121,6 +3157,8 @@ ShaderID GR_Shader_Compile(const char* source)
 		strcat(extra_fs_defines, "#define PSYX_NO_TEXFILTER\n");
 	if (s_compileNoFlashlight)
 		strcat(extra_fs_defines, "#define PSYX_NO_FLASHLIGHT\n");
+	if (s_compileOpaque)
+		strcat(extra_fs_defines, "#define PSYX_OPAQUE_TEX\n");
 #endif
 #endif
 
@@ -3375,7 +3413,11 @@ void GR_InitialisePSXShaders()
 	GR_CompilePSXShader(&g_lean_shader_8, gte_shader_8);
 	GR_CompilePSXShader(&g_lean_shader_16, gte_shader_16);
 	GR_CompilePSXShader(&g_lean_shader_32_rgba, gte_shader_32_rgba);
+	s_compileOpaque = 1;
+	GR_CompilePSXShader(&g_lean_shader_32_opaque, gte_shader_32_rgba);
 	s_compileNoFlashlight = 0;
+	GR_CompilePSXShader(&g_gte_shader_32_opaque, gte_shader_32_rgba);
+	s_compileOpaque = 0;
 #endif
 	Pc_ModernShader_Initialise(gte_shader_4, gte_shader_8, gte_shader_16, gte_shader_32_rgba);
 	GR_InitialisePSXShader(&g_modern_shader_4, Pc_ModernShader_Get(TF_4_BIT));
@@ -3542,7 +3584,14 @@ int GR_InitialisePSX()
 			glBindVertexArray(g_glVertexArray[i]);
 
 			glBindBuffer(GL_ARRAY_BUFFER, g_glVertexBuffer[i]);
+#if defined(PSYX_VITA)
+			/* Only vitaGL's buffer metadata: every upload points the buffer at
+			 * scratch memory (GR_UpdateVertexBuffer), so a full-size allocation
+			 * here was 2 x 17 MB dropped on the floor at the first upload. */
+			glBufferData(GL_ARRAY_BUFFER, sizeof(GrVertex), NULL, GL_STREAM_DRAW);
+#else
 			glBufferData(GL_ARRAY_BUFFER, sizeof(GrVertex) * MAX_VERTEX_BUFFER_SIZE, NULL, GL_DYNAMIC_DRAW);
+#endif
 		}
 
 		glBindVertexArray(0);
@@ -4229,9 +4278,228 @@ void GR_DestroyTexture(TextureID texture)
 #endif
 }
 
+#if defined(PSYX_VITA)
+/* Hardware-paletted texture cache (the approach of Rinnegatamante's CTR: High
+ * Octane Vita port). A 4/8-bit CLUT texel through the VRAM texture costs three
+ * dependent reads per pixel (index, CLUT entry, decode); the Vita GPU samples
+ * GL_PALETTE4/8_RGBA8_OES textures natively in one. One texture per (tpage,
+ * format, clut), built from the CPU vram[] and rebuilt when a 64x64-word tile
+ * under its page or palette is written. */
+extern "C" { int g_vitaPalCache = 1; unsigned g_vitaPalCacheStats[3]; }
+
+#define PALC_ENTRIES 256
+#define PALC_HASH    1024
+
+struct PalCacheEntry
+{
+	GLuint   tex;
+	int      key;
+	unsigned version;
+	unsigned lastFrame;
+	int      opaque;
+};
+
+static PalCacheEntry s_palc[PALC_ENTRIES];
+static short         s_palcHash[PALC_HASH];
+static unsigned      s_palcTileGen[VRAM_HEIGHT / 64][VRAM_WIDTH / 64];
+static unsigned      s_palcFrame = 1;
+static int           s_palcHashValid = 0;
+static unsigned char s_palcUpload[256 * 4 + 256 * 256];
+
+extern "C" void GR_VitaPalCacheNoteWrite(int x, int y, int w, int h)
+{
+	int tx0, tx1, ty0, ty1, tx, ty;
+
+	if (w <= 0 || h <= 0)
+		return;
+	if (x < 0) { w += x; x = 0; }
+	if (y < 0) { h += y; y = 0; }
+	if (x + w > VRAM_WIDTH)  w = VRAM_WIDTH - x;
+	if (y + h > VRAM_HEIGHT) h = VRAM_HEIGHT - y;
+	if (w <= 0 || h <= 0)
+		return;
+
+	tx0 = x / 64; tx1 = (x + w - 1) / 64;
+	ty0 = y / 64; ty1 = (y + h - 1) / 64;
+	for (ty = ty0; ty <= ty1; ty++)
+		for (tx = tx0; tx <= tx1; tx++)
+			s_palcTileGen[ty][tx]++;
+}
+
+static unsigned GR_PalcRectVersion(int x, int y, int w, int h)
+{
+	unsigned v = 0;
+	int tx, ty;
+	for (ty = y / 64; ty <= (y + h - 1) / 64; ty++)
+		for (tx = x / 64; tx <= (x + w - 1) / 64; tx++)
+			v += s_palcTileGen[ty][tx] * (unsigned)(1 + tx + ty * 16);
+	return v;
+}
+
+static int GR_PalcHashSlot(int key)
+{
+	return (int)(((unsigned)key * 2654435761u) & (PALC_HASH - 1));
+}
+
+static void GR_PalcRebuildHash(void)
+{
+	int i;
+	memset(s_palcHash, 0xff, sizeof(s_palcHash));
+	for (i = 0; i < PALC_ENTRIES; i++)
+	{
+		if (!s_palc[i].key)
+			continue;
+		int slot = GR_PalcHashSlot(s_palc[i].key);
+		while (s_palcHash[slot] >= 0)
+			slot = (slot + 1) & (PALC_HASH - 1);
+		s_palcHash[slot] = (short)i;
+	}
+	s_palcHashValid = 1;
+}
+
+extern "C" void GR_VitaPalCacheFrame(void)
+{
+	s_palcFrame++;
+}
+
+/* key: bit 0 set, bits 1-5 tpage (x bits 0-3, y bit 4), bit 6 = 8-bit, bits 7+ clut. */
+TextureID GR_VitaPaletteTexture(int key, int* opaque)
+{
+	const int tpage = (key >> 1) & 0x1F;
+	const int is8   = (key >> 6) & 1;
+	const int clut  = (key >> 7) & 0xFFFF;
+	const int px = (tpage & 15) * 64, py = ((tpage >> 4) & 1) * 256;
+	const int pw = is8 ? 128 : 64;
+	const int cx = (clut & 0x3F) * 16, cy = (clut >> 6) & 0x1FF;
+	const int cw = is8 ? 256 : 16;
+	int idx = -1, slot, i;
+
+	if (px + pw > VRAM_WIDTH || cx + cw > VRAM_WIDTH || cy >= VRAM_HEIGHT)
+		return 0;
+
+	const unsigned version = GR_PalcRectVersion(px, py, pw, 256) * 31u + GR_PalcRectVersion(cx, cy, cw, 1);
+
+	if (!s_palcHashValid)
+		GR_PalcRebuildHash();
+
+	for (slot = GR_PalcHashSlot(key); s_palcHash[slot] >= 0; slot = (slot + 1) & (PALC_HASH - 1))
+	{
+		if (s_palc[s_palcHash[slot]].key == key)
+		{
+			idx = s_palcHash[slot];
+			break;
+		}
+	}
+
+	if (idx >= 0 && s_palc[idx].version == version && s_palc[idx].tex)
+	{
+		s_palc[idx].lastFrame = s_palcFrame;
+		g_vitaPalCacheStats[0]++;
+		*opaque = s_palc[idx].opaque;
+		return s_palc[idx].tex;
+	}
+
+	if (idx < 0)
+	{
+		unsigned oldest = 0xFFFFFFFFu;
+		for (i = 0; i < PALC_ENTRIES; i++)
+		{
+			if (!s_palc[i].key) { idx = i; break; }
+			if (s_palc[i].lastFrame + 2u < s_palcFrame && s_palc[i].lastFrame < oldest)
+			{
+				oldest = s_palc[i].lastFrame;
+				idx = i;
+			}
+		}
+		if (idx < 0)
+		{
+			g_vitaPalCacheStats[2]++;
+			return 0;
+		}
+		s_palc[idx].key = key;
+		s_palcHashValid = 0;
+	}
+
+	if (!s_palc[idx].tex)
+	{
+		glGenTextures(1, &s_palc[idx].tex);
+		glBindTexture(GL_TEXTURE_2D, s_palc[idx].tex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+	}
+
+	/* Colour v5*8/256 is what the VRAM path's decode outputs; rounded to 8 bits
+	 * it lands on the same framebuffer value. Alpha follows lut(): 0 for colour
+	 * 0 (a hole), just over 0.5 for STP texels, opaque otherwise. */
+	{
+		const unsigned short* pal = vram + cy * VRAM_WIDTH + cx;
+		unsigned char* out = s_palcUpload;
+		int n;
+		s_palc[idx].opaque = 1;
+		for (n = 0; n < cw; n++, out += 4)
+		{
+			const unsigned short c = pal[n];
+			if (c == 0)
+				s_palc[idx].opaque = 0;
+			out[0] = (unsigned char)(((c & 31) * 2040 + 128) >> 8);
+			out[1] = (unsigned char)((((c >> 5) & 31) * 2040 + 128) >> 8);
+			out[2] = (unsigned char)((((c >> 10) & 31) * 2040 + 128) >> 8);
+			out[3] = (c == 0) ? 0 : ((c & 0x8000) ? 128 : 255);
+		}
+
+		int row;
+		for (row = 0; row < 256; row++)
+		{
+			const unsigned char* src = (const unsigned char*)(vram + (py + row) * VRAM_WIDTH + px);
+			if (is8)
+			{
+				memcpy(out + row * 256, src, 256);
+			}
+			else
+			{
+				unsigned char* dst = out + row * 128;
+				int b;
+				for (b = 0; b < 128; b++)
+					dst[b] = (unsigned char)((src[b] << 4) | (src[b] >> 4));
+			}
+		}
+
+		glBindTexture(GL_TEXTURE_2D, s_palc[idx].tex);
+		glCompressedTexImage2D(GL_TEXTURE_2D, 0, is8 ? GL_PALETTE8_RGBA8_OES : GL_PALETTE4_RGBA8_OES,
+		                       256, 256, 0, cw * 4 + (is8 ? 256 * 256 : 128 * 256), s_palcUpload);
+		g_lastBoundTexture = (TextureID)-1;
+	}
+
+	s_palc[idx].version   = version;
+	s_palc[idx].lastFrame = s_palcFrame;
+	g_vitaPalCacheStats[1]++;
+	*opaque = s_palc[idx].opaque;
+	return s_palc[idx].tex;
+}
+
+/* Binds a cached palette texture through the RGBA override path. */
+void GR_VitaSetPaletteTexture(TextureID tex, int noDiscard)
+{
+	GTEShader* shader;
+	const int lean = !(g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive);
+
+	if (noDiscard)
+		shader = lean ? &g_lean_shader_32_opaque : &g_gte_shader_32_opaque;
+	else
+		shader = lean ? &g_lean_shader_32_rgba : &g_gte_shader_32_rgba;
+	GR_SetTextureShader(tex, TF_32_BIT_RGBA, shader);
+	GR_SetOverrideTextureSize(256, 256, 0, 0, 256, 256);
+}
+#endif
+
 void GR_ClearVRAM(int x, int y, int w, int h, unsigned char r, unsigned char g, unsigned char b)
 {
 	vram_need_update = 1;
+#if defined(PSYX_VITA)
+	GR_VitaPalCacheNoteWrite(x, y, w, h);
+#endif
 
 	u_short* dst = vram + x + y * VRAM_WIDTH;
 
@@ -4544,6 +4812,9 @@ void GR_SaveVRAM(const char* outputFileName, int x, int y, int width, int height
 
 void GR_CopyRGBAFramebufferToVRAM(u_int* src, int x, int y, int w, int h, int update_vram, int flip_y)
 {
+#if defined(PSYX_VITA)
+	GR_VitaPalCacheNoteWrite(x, y, w, h);
+#endif
 	assert(x >= 0);
 	assert(y >= 0);
 	assert(x + w <= VRAM_WIDTH);
@@ -6426,8 +6697,19 @@ static void GR_EnsureFbPackTarget(int w, int h)
 /* Pack the captured frame into one VRAM rect. Saves/restores viewport + FBO and
  * invalidates the renderer's cached GL state, so this is safe to run mid-frame
  * (GR_UpdateVRAM calls it after a full vram[] re-upload). */
+#if defined(PSYX_VITA)
+/* Set whenever something other than the CPU vram[] upload lands in a feedback
+ * rect. The per-present blank only has work to do then: a full re-upload
+ * re-blanks the rects itself (GR_RepackFrameToVramBuffers), and every blank
+ * costs two extra GPU scenes on the tiler. */
+static int s_fbRectsDirty = 1;
+#endif
+
 static void GR_PackFrameToVramRectGain(int x, int y, int w, int h, float gain)
 {
+#if defined(PSYX_VITA)
+	s_fbRectsDirty = 1;
+#endif
 #if USE_OPENGL
 	GLint vp[4];
 
@@ -6960,7 +7242,15 @@ extern "C" void GR_StoreFrameBufferPsx(void)
 	 * frame. See g_PsxFeedbackStoreAllowed. */
 	if (g_PsxFeedbackStoreAllowed <= 0)
 	{
+#if defined(PSYX_VITA)
+		if (s_fbRectsDirty)
+		{
+			GR_ClearAllFeedbackRects();
+			s_fbRectsDirty = 0;
+		}
+#else
 		GR_ClearAllFeedbackRects();
+#endif
 		GR_SceneRedirectTick();
 		return;
 	}
@@ -7284,6 +7574,9 @@ void GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int
 	 * for a few frames so the game's own data always wins. Scenes that keep
 	 * uploading there simply keep the effect off, which is the correct trade. */
 	GR_NoteVramUploadForFeedback(dst_x, dst_y, w, h);
+#if defined(PSYX_VITA)
+	GR_VitaPalCacheNoteWrite(dst_x, dst_y, w, h);
+#endif
 
 	unsigned short* dst = vram + dst_x + dst_y * VRAM_WIDTH;
 
@@ -7391,6 +7684,9 @@ void GR_DirectUploadVRAMRegion(int x, int y, int w, int h)
 		glBindTexture(GL_TEXTURE_2D, g_vramTexturesDouble[i]);
 		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, VRAM_FORMAT, GL_UNSIGNED_BYTE, block);
 	}
+#if defined(PSYX_VITA)
+	s_fbRectsDirty = 1;
+#endif
 	glBindTexture(GL_TEXTURE_2D, g_lastBoundTexture);
 
 	free(block);
@@ -7932,6 +8228,7 @@ void GR_BindVertexBuffer()
 {
 #if USE_OPENGL
 	glBindVertexArray(g_glVertexArray[g_curVertexBuffer]);
+	glBindBuffer(GL_ARRAY_BUFFER, g_glVertexBuffer[g_curVertexBuffer]);
 
 	glEnableVertexAttribArray(a_position);
 	glEnableVertexAttribArray(a_texcoord);
@@ -8049,10 +8346,27 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 	 * and smallest on a discrete desktop card — but it is never a pessimisation,
 	 * and the size is constant so drivers can recycle identical blocks. */
 #if defined(PSYX_VITA)
-	/* vitaGL backs every glBufferData with a fresh GPU allocation (the old one
-	 * is garbage-collected after the frame), so orphaning the full 17 MB here
-	 * allocated it several times per frame. One allocation of what is used. */
-	glBufferData(GL_ARRAY_BUFFER, num_vertices * sizeof(GrVertex), vertices, GL_STREAM_DRAW);
+	/* vitaGL backs every glBufferData with a fresh GPU allocation that its
+	 * garbage collector frees later, and vglSwapBuffers waits on that thread.
+	 * The per-frame scratch pool (valid for 3 frames) needs neither. Never
+	 * glBufferData this buffer once it points at scratch: vitaGL would free
+	 * the scratch pointer as if it owned it. */
+	if (num_vertices > 0)
+	{
+		const size_t bytes = (size_t)num_vertices * sizeof(GrVertex);
+		void* gpu = vglAllocFromScratch(bytes);
+		if (gpu != NULL)
+		{
+			memcpy(gpu, vertices, bytes);
+			vglBufferData(GL_ARRAY_BUFFER, gpu);
+		}
+		else
+		{
+			static int s_logged = 0;
+			if (s_logged++ < 5)
+				eprinterr("vglAllocFromScratch(%u) failed - vertex batch dropped\n", (unsigned)bytes);
+		}
+	}
 #else
 	glBufferData(GL_ARRAY_BUFFER, MAX_VERTEX_BUFFER_SIZE * sizeof(GrVertex), NULL, GL_STREAM_DRAW);
 	glBufferSubData(GL_ARRAY_BUFFER, 0, num_vertices * sizeof(GrVertex), vertices);

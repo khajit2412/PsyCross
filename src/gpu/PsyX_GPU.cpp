@@ -707,9 +707,17 @@ extern "C" float g_PsxFeedbackDampBlend;
  * 127/128, and 127 is a PS1 decay frame for its copy loop). */
 static int s_curPrimR0 = 128;
 
+#if defined(__vita__)
+static int s_curPrimClut = 0;
+extern "C" int g_vitaPalCache;
+#endif
+
 static inline void ApplyHiresOverride(int tpage, int clut)
 {
 	int nW = 0, nH = 0, offX = 0, offY = 0, hiW = 0, hiH = 0;
+#if defined(__vita__)
+	s_curPrimClut = clut;
+#endif
 
 	/* Framebuffer-feedback consumers announce themselves here: 16bpp (tp >= 2)
 	 * addressing the left 320 VRAM columns is the display-buffer band, which is
@@ -1712,6 +1720,9 @@ struct GPUDrawSplit
 	int				overrideHiresH;
 
 	const char*		debugText;
+
+	/* Vita hardware-paletted texture key (GR_VitaPaletteTexture), 0 = none. */
+	int				palKey;
 };
 
 /* 4096 was reached in ordinary play on a dense outdoor map (a user capture hit
@@ -2866,6 +2877,13 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 	 * state they never sample, fragmenting them once normal maps exist. */
 	TextureID normalTextureId = (textured && overrideTexture != 0) ? overrideNormalTexture : 0;
 
+	int palKey = 0;
+#if defined(__vita__)
+	if (g_vitaPalCache && textured && overrideTexture == 0 && !s_curPrimIsFeedback && !s_curPrimIsScratch &&
+	    (texFormat == TF_4_BIT || texFormat == TF_8_BIT))
+		palKey = 1 | ((tpage & 0x1F) << 1) | ((texFormat == TF_8_BIT) << 6) | ((s_curPrimClut & 0xFFFF) << 7);
+#endif
+
 	// FIXME: compare drawing environment too?
 	if (curSplit.kind == GPU_SPLIT_LEGACY &&
 		curSplit.blendMode == blendMode &&
@@ -2888,7 +2906,8 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 		curSplit.drawenv.clip.w == activeDrawEnv.clip.w &&
 		curSplit.drawenv.clip.h == activeDrawEnv.clip.h &&
 		curSplit.drawenv.dfe == activeDrawEnv.dfe &&
-		curSplit.debugText == currentSplitDebugText)
+		curSplit.debugText == currentSplitDebugText &&
+		curSplit.palKey == palKey)
 	{
 		return;
 	}
@@ -2899,7 +2918,7 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 	if (curSplit.kind != GPU_SPLIT_LEGACY)                g_splitCause[7]++;
 	else if (curSplit.blendMode != blendMode)              g_splitCause[0]++;
 	else if (curSplit.texFormat != texFormat)              g_splitCause[1]++;
-	else if (curSplit.textureId != textureId)              g_splitCause[2]++;
+	else if (curSplit.textureId != textureId || curSplit.palKey != palKey) g_splitCause[2]++;
 	else if (curSplit.depthMode != depthMode)              g_splitCause[3]++;
 	else if (curSplit.drawPrimMode != g_DrawPrimMode)      g_splitCause[4]++;
 	else if (curSplit.drawenv.clip.x != activeDrawEnv.clip.x || curSplit.drawenv.clip.y != activeDrawEnv.clip.y ||
@@ -2930,6 +2949,7 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 	split.texFormat = texFormat;
 	split.textureId = textureId;
 	split.normalTextureId = normalTextureId;
+	split.palKey = palKey;
 	split.drawPrimMode = g_DrawPrimMode;
 	split.depthMode = depthMode;
 	split.drawenv = activeDrawEnv;
@@ -3047,6 +3067,13 @@ void DrawSplit(const GPUDrawSplit& split)
 	GR_SetStencilMode(split.drawPrimMode);	// draw with mask 0x16
 
 	unsigned long long t1 = SPLIT_T();
+#if defined(__vita__)
+	int palOpaque = 0;
+	TextureID palTex = split.palKey ? GR_VitaPaletteTexture(split.palKey, &palOpaque) : 0;
+	if (palTex != 0)
+		GR_VitaSetPaletteTexture(palTex, palOpaque && split.blendMode == BM_NONE);
+	else
+#endif
 	GR_SetTexture(split.textureId, split.texFormat);
 
 	if (split.texFormat == TF_32_BIT_RGBA)
@@ -3183,6 +3210,7 @@ static void Vita_MarkUntextured(GPUDrawSplit& s, const GPUDrawSplit& vram)
 	}
 	s.textureId = g_vramTexture;
 	s.texFormat = vram.texFormat;
+	s.palKey = vram.palKey;
 }
 
 /* A draw call costs ~20 us on vitaGL and interiors issue ~800 a frame, most of
@@ -3190,9 +3218,40 @@ static void Vita_MarkUntextured(GPUDrawSplit& s, const GPUDrawSplit& vram)
  * ones. Untextured prims are folded into the neighbouring VRAM split through
  * the shader's ulo > uhi marker, then adjacent splits with equal state are
  * joined. Order is preserved, so the result is pixel-identical. */
+/* A cached palette split saves the GPU two dependent reads per pixel but
+ * costs a draw call (~30 us CPU) whenever the palette changes, and in town the
+ * OT interleaves small prims with different palettes: 450 draws a frame.
+ * Splits covering less than this screen area (PSX pixels, bounding box) fall
+ * back to the VRAM path, where they merge with their neighbours again. */
+extern "C" { int g_vitaPalMinArea = 1024; }
+
+static void Vita_DropSmallPaletteSplits()
+{
+	for (int i = 1; i <= g_splitIndex; i++)
+	{
+		GPUDrawSplit& s = g_splits[i];
+		if (s.kind != GPU_SPLIT_LEGACY || !s.palKey || s.numVerts == 0)
+			continue;
+
+		const GrVertex* v = &g_vertexBuffer[s.startVertex];
+		int x0 = v->x, x1 = v->x, y0 = v->y, y1 = v->y;
+		for (unsigned n = 1; n < s.numVerts; n++)
+		{
+			if (v[n].x < x0) x0 = v[n].x;
+			if (v[n].x > x1) x1 = v[n].x;
+			if (v[n].y < y0) y0 = v[n].y;
+			if (v[n].y > y1) y1 = v[n].y;
+		}
+		if ((x1 - x0) * (y1 - y0) < g_vitaPalMinArea)
+			s.palKey = 0;
+	}
+}
+
 static void Vita_BatchSplits()
 {
 	int out = 0;
+
+	Vita_DropSmallPaletteSplits();
 	for (int i = 1; i <= g_splitIndex; i++)
 	{
 		GPUDrawSplit s = g_splits[i];
@@ -3209,7 +3268,7 @@ static void Vita_BatchSplits()
 				else if (p.textureId == g_whiteTexture && s.textureId == g_vramTexture && s.texFormat != TF_32_BIT_RGBA)
 					Vita_MarkUntextured(p, s);
 
-				if (p.textureId == s.textureId && p.texFormat == s.texFormat)
+				if (p.textureId == s.textureId && p.texFormat == s.texFormat && p.palKey == s.palKey)
 				{
 					p.numVerts += s.numVerts;
 					continue;

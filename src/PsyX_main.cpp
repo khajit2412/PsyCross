@@ -315,8 +315,23 @@ int intrThreadMain(void* data)
 		/* The loop never slept. On a desktop that costs one of many cores; the
 		 * Vita gives an app three, and this spin starved the GXM display-queue
 		 * thread that vglSwapBuffers waits on (~36 ms per swap, whatever was
-		 * drawn). 200 us is well inside the 1.73 ms RCnt2 period. */
-		sceKernelDelayThread(200);
+		 * drawn). A fixed 200 us still meant 5000 high-priority wake-ups a
+		 * second preempting the game, display and vitaGL GC threads, so it
+		 * sleeps to the next vblank or RCnt2 tick instead. */
+		{
+			const double timestep = g_vmode == MODE_NTSC ? FIXED_TIME_STEP_NTSC : FIXED_TIME_STEP_PAL;
+			double wait = (vblDone + 1) * timestep - Util_GetHPCTime(&g_vblTimer, 0);
+			if (g_rcnt2_timer_active)
+			{
+				const double rcnt2Wait = rcnt2Period - Util_GetHPCTime(&rcnt2Timer, 0);
+				if (rcnt2Wait < wait)
+					wait = rcnt2Wait;
+			}
+			int us = (int)(wait * 1000000.0);
+			if (us < 200) us = 200;
+			if (us > 4000) us = 4000;
+			sceKernelDelayThread(us);
+		}
 #endif
 	}
 
@@ -1157,6 +1172,9 @@ extern "C" void (*g_PsyX_PostCaptureHook)(void) = NULL;
 #if defined(__vita__)
 extern "C" unsigned long long g_splitUs[4];
 extern "C" unsigned g_splitCause[8];
+extern "C" unsigned g_vitaPalCacheStats[3];
+extern "C" int g_vitaPalCache;
+extern "C" int g_vitaPalMinArea;
 #endif
 
 #if defined(__vita__)
@@ -1165,11 +1183,15 @@ extern "C" unsigned g_splitCause[8];
 static Uint64 s_esUs[6];
 static unsigned s_esFrames;
 static Uint64 s_esMark;
+static Uint64 s_esLastUs;
 static void ES_Mark(int stage)
 {
 	const Uint64 now = SDL_GetPerformanceCounter();
 	if (stage >= 0)
-		s_esUs[stage] += (now - s_esMark) * 1000000 / SDL_GetPerformanceFrequency();
+	{
+		s_esLastUs = (now - s_esMark) * 1000000 / SDL_GetPerformanceFrequency();
+		s_esUs[stage] += s_esLastUs;
+	}
 	s_esMark = now;
 }
 #define ES_MARK(stage) ES_Mark(stage)
@@ -1241,19 +1263,53 @@ void PsyX_EndScene()
 	}
 	ES_MARK(4);
 
+#if defined(__vita__)
+	/* Every 60th frame, wait for the GPU before swapping: the drain is the
+	 * GPU work still queued when the CPU finished the frame, and the swap that
+	 * follows is then pure display-queue / vitaGL garbage-collector waiting. */
+	static Uint64 s_drainUs, s_drainMaxUs, s_drainSwapUs;
+	static unsigned s_drainN;
+	const int drainFrame = (s_esFrames % 60) == 30;
+	if (drainFrame)
+	{
+		const Uint64 d0 = SDL_GetPerformanceCounter();
+		glFinish();
+		const Uint64 us = (SDL_GetPerformanceCounter() - d0) * 1000000 / SDL_GetPerformanceFrequency();
+		s_drainUs += us;
+		if (us > s_drainMaxUs) s_drainMaxUs = us;
+		s_drainN++;
+		ES_MARK(-1);
+	}
+#endif
+
 	GR_SwapWindow();
 	ES_MARK(5);
 
 #if defined(__vita__)
+	if (drainFrame)
+		s_drainSwapUs += s_esLastUs;
+
 	if (++s_esFrames >= 300)
 	{
 		const double n = (double)s_esFrames;
+		{
+			eprintf("[PALCACHE] %s minArea=%d per frame: hits=%.1f builds=%.1f full=%.1f\n", g_vitaPalCache ? "on" : "off",
+			        g_vitaPalMinArea, g_vitaPalCacheStats[0] / n, g_vitaPalCacheStats[1] / n, g_vitaPalCacheStats[2] / n);
+			memset(g_vitaPalCacheStats, 0, sizeof(g_vitaPalCacheStats));
+		}
+		if (s_drainN)
+			eprintf("[GPUDRAIN] %u samples: gpu backlog avg=%.2f max=%.2f ms, swap after drain avg=%.2f ms\n",
+			        s_drainN, s_drainUs / (double)s_drainN / 1000.0, s_drainMaxUs / 1000.0,
+			        s_drainSwapUs / (double)s_drainN / 1000.0);
+		s_drainUs = s_drainMaxUs = s_drainSwapUs = 0;
+		s_drainN = 0;
 		eprintf("[ENDSCENE] ms/frame: end=%.2f fbstore=%.2f capture=%.2f hook=%.2f post=%.2f swap=%.2f\n",
 		        s_esUs[0] / n / 1000.0, s_esUs[1] / n / 1000.0, s_esUs[2] / n / 1000.0,
 		        s_esUs[3] / n / 1000.0, s_esUs[4] / n / 1000.0, s_esUs[5] / n / 1000.0);
-		eprintf("[GLCOUNT] per frame: fboBind=%.1f clear=%.1f readPixels=%.1f copyTex=%.1f texUpload=%.1f draws=%.1f\n",
+		eprintf("[GLCOUNT] per frame: fboBind=%.1f clear=%.1f readPixels=%.1f copyTex=%.1f texUpload=%.1f draws=%.1f scissor=%.1f\n",
 		        g_vitaGlCount[VGLC_FBO] / n, g_vitaGlCount[VGLC_CLEAR] / n, g_vitaGlCount[VGLC_READ] / n,
-		        g_vitaGlCount[VGLC_COPYTEX] / n, g_vitaGlCount[VGLC_TEXUP] / n, g_vitaGlCount[VGLC_DRAW] / n);
+		        g_vitaGlCount[VGLC_COPYTEX] / n, g_vitaGlCount[VGLC_TEXUP] / n, g_vitaGlCount[VGLC_DRAW] / n,
+		        g_vitaGlCount[VGLC_SCISSOR] / n);
 		{
 			eprintf("[SPLITS] ms/frame: texture+shader=%.2f clip+viewport=%.2f blend/stencil/depth=%.2f draw=%.2f\n",
 			        g_splitUs[0] / n / 1000.0, g_splitUs[1] / n / 1000.0,
