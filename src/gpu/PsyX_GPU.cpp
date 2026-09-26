@@ -3031,7 +3031,7 @@ int g_PsxDbgAddMode = 1;
 /* Microseconds per part of a draw split on Vita: texture/shader, clip and
  * offscreen state, the other state setters, the draw call. Reported with
  * [ENDSCENE] by PsyX_EndScene. */
-extern "C" { unsigned long long g_splitUs[4]; }
+extern "C" { unsigned long long g_splitUs[4]; unsigned long long g_submitUs[4]; }
 #define SPLIT_T() sceKernelGetProcessTimeWide()
 #else
 #define SPLIT_T() 0ULL
@@ -3164,12 +3164,16 @@ static bool ShadowTriangleCanCast(const GrVertex* vertex)
 	return true;
 }
 
+/* The vertices this flush draws from: g_vertexBuffer, or on Vita the reordered
+ * copy Vita_ReorderSplits wrote (saves copying it back). */
+static GrVertex* s_drawVerts = g_vertexBuffer;
+
 static void DrawShadowCasters(const GPUDrawSplit& split)
 {
 	int runStart = -1;
 	for (int offset = 0; offset + 2 < split.numVerts; offset += 3)
 	{
-		if (ShadowTriangleCanCast(&g_vertexBuffer[split.startVertex + offset]))
+		if (ShadowTriangleCanCast(&s_drawVerts[split.startVertex + offset]))
 		{
 			if (runStart < 0)
 				runStart = offset;
@@ -3205,8 +3209,8 @@ static void Vita_MarkUntextured(GPUDrawSplit& s, const GPUDrawSplit& vram)
 {
 	for (unsigned v = s.startVertex; v < s.startVertex + s.numVerts; v++)
 	{
-		g_vertexBuffer[v].ulo = 255;
-		g_vertexBuffer[v].uhi = 0;
+		s_drawVerts[v].ulo = 255;
+		s_drawVerts[v].uhi = 0;
 	}
 	s.textureId = g_vramTexture;
 	s.texFormat = vram.texFormat;
@@ -3223,10 +3227,12 @@ static void Vita_MarkUntextured(GPUDrawSplit& s, const GPUDrawSplit& vram)
  * OT interleaves small prims with different palettes: 450 draws a frame.
  * Splits covering less than this screen area (PSX pixels, bounding box) fall
  * back to the VRAM path, where they merge with their neighbours again. */
-extern "C" { int g_vitaPalMinArea = 1024; }
+extern "C" { int g_vitaPalMinArea = 0; }
 
 static void Vita_DropSmallPaletteSplits()
 {
+	if (g_vitaPalMinArea <= 0)
+		return;
 	for (int i = 1; i <= g_splitIndex; i++)
 	{
 		GPUDrawSplit& s = g_splits[i];
@@ -3247,11 +3253,173 @@ static void Vita_DropSmallPaletteSplits()
 	}
 }
 
+/* Draw reordering, after CTR: High Octane's scheduler (native_gpu.c). Two
+ * splits whose screen rectangles do not overlap touch disjoint pixels, so
+ * their order cannot change the image -- depth, stencil and blending are all
+ * per pixel. Each split looks back over the last VITA_REORDER_WINDOW groups
+ * for one with identical state and joins it if it overlaps nothing drawn in
+ * between; the first overlapping group it cannot join stops the search. CTR
+ * compares all pairs (capped at 256); the window keeps this linear. Offscreen
+ * (dfe = 0) splits switch render target and write VRAM back on the switch,
+ * and modern / capture splits act on the frame as drawn so far, so none of
+ * them moves or is moved across. Vertices are rewritten in the new order so
+ * the merge below joins each group into one draw. */
+extern "C" { int g_vitaReorder = 1; }
+
+#define VITA_REORDER_WINDOW 32
+
+struct VitaSplitBox { short x0, y0, x1, y1; };
+
+static VitaSplitBox s_splitBox[MAX_DRAW_SPLITS];
+static VitaSplitBox s_groupBox[MAX_DRAW_SPLITS];
+static int          s_groupRep[MAX_DRAW_SPLITS];
+static int          s_groupLast[MAX_DRAW_SPLITS];
+static int          s_splitNext[MAX_DRAW_SPLITS];
+static int          s_groupFirst[MAX_DRAW_SPLITS];
+static GPUDrawSplit s_reorderSplits[MAX_DRAW_SPLITS];
+static GrVertex*    s_reorderVerts = NULL;
+static int          s_reorderVertsCap = 0;
+
+static inline bool Vita_BoxesOverlap(const VitaSplitBox& a, const VitaSplitBox& b)
+{
+	/* One PSX pixel of margin: scaled up, touching edges can share a pixel. */
+	return !(a.x1 + 1 < b.x0 || b.x1 + 1 < a.x0 || a.y1 + 1 < b.y0 || b.y1 + 1 < a.y0);
+}
+
+static inline bool Vita_SplitMovable(const GPUDrawSplit& s)
+{
+	return s.kind == GPU_SPLIT_LEGACY && s.drawenv.dfe && s.numVerts > 0;
+}
+
+static inline bool Vita_SplitsSameState(const GPUDrawSplit& a, const GPUDrawSplit& b)
+{
+	return a.textureId == b.textureId && a.texFormat == b.texFormat && a.palKey == b.palKey &&
+		Vita_SplitKeysMatch(a, b);
+}
+
+static void Vita_ReorderSplits()
+{
+	int groupCount = 0, groupBase = 0, outSplits = 0, outVerts = 0;
+	int i;
+
+	if (g_splitIndex < 3 || g_vertexIndex <= 0)
+		return;
+
+	if (s_reorderVertsCap < g_vertexIndex)
+	{
+		GrVertex* grown = (GrVertex*)realloc(s_reorderVerts, sizeof(GrVertex) * g_vertexIndex);
+		if (!grown)
+			return;
+		s_reorderVerts = grown;
+		s_reorderVertsCap = g_vertexIndex;
+	}
+
+	for (i = 1; i <= g_splitIndex; i++)
+	{
+		const GPUDrawSplit& s = g_splits[i];
+		if (!Vita_SplitMovable(s))
+			continue;
+		const GrVertex* v = &g_vertexBuffer[s.startVertex];
+		VitaSplitBox b = { v->x, v->y, v->x, v->y };
+		for (unsigned n = 1; n < s.numVerts; n++)
+		{
+			if (v[n].x < b.x0) b.x0 = v[n].x;
+			if (v[n].x > b.x1) b.x1 = v[n].x;
+			if (v[n].y < b.y0) b.y0 = v[n].y;
+			if (v[n].y > b.y1) b.y1 = v[n].y;
+		}
+		s_splitBox[i] = b;
+	}
+
+	/* Emits groups [groupBase, groupCount) and resets the window. */
+	#define VITA_FLUSH_GROUPS()                                                      \
+		do {                                                                          \
+			for (int g = groupBase; g < groupCount; g++)                              \
+				for (int m = s_groupFirst[g]; m >= 0; m = s_splitNext[m])             \
+				{                                                                     \
+					GPUDrawSplit& d = s_reorderSplits[++outSplits];                   \
+					d = g_splits[m];                                                  \
+					memcpy(&s_reorderVerts[outVerts], &g_vertexBuffer[d.startVertex], \
+					       sizeof(GrVertex) * d.numVerts);                            \
+					d.startVertex = outVerts;                                         \
+					outVerts += d.numVerts;                                           \
+				}                                                                     \
+			groupBase = groupCount;                                                   \
+		} while (0)
+
+	for (i = 1; i <= g_splitIndex; i++)
+	{
+		const GPUDrawSplit& s = g_splits[i];
+
+		if (s.kind == GPU_SPLIT_LEGACY && s.numVerts == 0)
+		{
+			GPUDrawSplit& d = s_reorderSplits[++outSplits];
+			d = s;
+			d.startVertex = outVerts;
+			continue;
+		}
+
+		if (!Vita_SplitMovable(s))
+		{
+			VITA_FLUSH_GROUPS();
+			GPUDrawSplit& d = s_reorderSplits[++outSplits];
+			d = s;
+			memcpy(&s_reorderVerts[outVerts], &g_vertexBuffer[s.startVertex], sizeof(GrVertex) * s.numVerts);
+			d.startVertex = outVerts;
+			outVerts += s.numVerts;
+			continue;
+		}
+
+		int target = -1;
+		for (int g = groupCount - 1; g >= groupBase && g >= groupCount - VITA_REORDER_WINDOW; g--)
+		{
+			if (Vita_SplitsSameState(g_splits[s_groupRep[g]], s))
+			{
+				target = g;
+				break;
+			}
+			if (Vita_BoxesOverlap(s_groupBox[g], s_splitBox[i]))
+				break;
+		}
+
+		s_splitNext[i] = -1;
+		if (target >= 0)
+		{
+			s_splitNext[s_groupLast[target]] = i;
+			s_groupLast[target] = i;
+			VitaSplitBox& gb = s_groupBox[target];
+			const VitaSplitBox& sb = s_splitBox[i];
+			if (sb.x0 < gb.x0) gb.x0 = sb.x0;
+			if (sb.y0 < gb.y0) gb.y0 = sb.y0;
+			if (sb.x1 > gb.x1) gb.x1 = sb.x1;
+			if (sb.y1 > gb.y1) gb.y1 = sb.y1;
+		}
+		else
+		{
+			s_groupRep[groupCount]   = i;
+			s_groupFirst[groupCount] = i;
+			s_groupLast[groupCount]  = i;
+			s_groupBox[groupCount]   = s_splitBox[i];
+			groupCount++;
+		}
+	}
+	VITA_FLUSH_GROUPS();
+	#undef VITA_FLUSH_GROUPS
+
+	if (outVerts != g_vertexIndex || outSplits != g_splitIndex)
+		return;
+
+	memcpy(&g_splits[1], &s_reorderSplits[1], sizeof(GPUDrawSplit) * outSplits);
+	s_drawVerts = s_reorderVerts;
+}
+
 static void Vita_BatchSplits()
 {
 	int out = 0;
 
 	Vita_DropSmallPaletteSplits();
+	if (g_vitaReorder)
+		Vita_ReorderSplits();
 	for (int i = 1; i <= g_splitIndex; i++)
 	{
 		GPUDrawSplit s = g_splits[i];
@@ -3313,11 +3481,17 @@ void DrawAllSplits()
 #endif // _DEBUG
 
 #if defined(__vita__)
+	const unsigned long long sb0 = SPLIT_T();
+	s_drawVerts = g_vertexBuffer;
 	Vita_BatchSplits();
+	const unsigned long long sb1 = SPLIT_T();
 #endif
 
 	// next code ideally should be called before EndScene
-	GR_UpdateVertexBuffer(g_vertexBuffer, g_vertexIndex);
+	GR_UpdateVertexBuffer(s_drawVerts, g_vertexIndex);
+#if defined(__vita__)
+	const unsigned long long sb2 = SPLIT_T();
+#endif
 
 	/* Flashlight shadow map: depth-only pre-pass over the OPAQUE splits from the
 	 * light POV, into the shadow FBO, while the frame VAO is still bound. Only
@@ -3345,6 +3519,9 @@ void DrawAllSplits()
 
 	if (g_PsxUsePgxp && g_splitIndex > s_dbgSplitHighWater)
 		s_dbgSplitHighWater = g_splitIndex;
+#if defined(__vita__)
+	const unsigned long long sb3 = SPLIT_T();
+#endif
 
 	for (int i = 1; i <= g_splitIndex; i++)
 	{
@@ -3356,6 +3533,15 @@ void DrawAllSplits()
 		else
 			DrawSplit(g_splits[i]);
 	}
+#if defined(__vita__)
+	{
+		const unsigned long long sb4 = SPLIT_T();
+		g_submitUs[0] += sb1 - sb0;
+		g_submitUs[1] += sb2 - sb1;
+		g_submitUs[2] += sb3 - sb2;
+		g_submitUs[3] += sb4 - sb3;
+	}
+#endif
 
 	ClearSplits();
 }

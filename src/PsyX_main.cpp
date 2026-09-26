@@ -1171,10 +1171,12 @@ extern "C" void (*g_PsyX_PostCaptureHook)(void) = NULL;
 
 #if defined(__vita__)
 extern "C" unsigned long long g_splitUs[4];
+extern "C" unsigned long long g_submitUs[4];
 extern "C" unsigned g_splitCause[8];
 extern "C" unsigned g_vitaPalCacheStats[3];
 extern "C" int g_vitaPalCache;
 extern "C" int g_vitaPalMinArea;
+extern "C" int g_vitaReorder;
 #endif
 
 #if defined(__vita__)
@@ -1293,8 +1295,8 @@ void PsyX_EndScene()
 	{
 		const double n = (double)s_esFrames;
 		{
-			eprintf("[PALCACHE] %s minArea=%d per frame: hits=%.1f builds=%.1f full=%.1f\n", g_vitaPalCache ? "on" : "off",
-			        g_vitaPalMinArea, g_vitaPalCacheStats[0] / n, g_vitaPalCacheStats[1] / n, g_vitaPalCacheStats[2] / n);
+			eprintf("[PALCACHE] %s minArea=%d reorder=%d per frame: hits=%.1f builds=%.1f full=%.1f\n", g_vitaPalCache ? "on" : "off",
+			        g_vitaPalMinArea, g_vitaReorder, g_vitaPalCacheStats[0] / n, g_vitaPalCacheStats[1] / n, g_vitaPalCacheStats[2] / n);
 			memset(g_vitaPalCacheStats, 0, sizeof(g_vitaPalCacheStats));
 		}
 		if (s_drainN)
@@ -1315,6 +1317,10 @@ void PsyX_EndScene()
 			        g_splitUs[0] / n / 1000.0, g_splitUs[1] / n / 1000.0,
 			        g_splitUs[2] / n / 1000.0, g_splitUs[3] / n / 1000.0);
 			memset(g_splitUs, 0, sizeof(g_splitUs));
+			eprintf("[SUBMIT] ms/frame: batch+reorder=%.2f vertexUpload=%.2f shadowPass=%.2f splitLoop=%.2f\n",
+			        g_submitUs[0] / n / 1000.0, g_submitUs[1] / n / 1000.0,
+			        g_submitUs[2] / n / 1000.0, g_submitUs[3] / n / 1000.0);
+			memset(g_submitUs, 0, sizeof(g_submitUs));
 			eprintf("[SPLITCAUSE] per frame: blend=%.1f format=%.1f texture=%.1f depth=%.1f primMode=%.1f clip=%.1f dfe=%.1f other=%.1f\n",
 			        g_splitCause[0] / n, g_splitCause[1] / n, g_splitCause[2] / n, g_splitCause[3] / n,
 			        g_splitCause[4] / n, g_splitCause[5] / n, g_splitCause[6] / n, g_splitCause[7] / n);
