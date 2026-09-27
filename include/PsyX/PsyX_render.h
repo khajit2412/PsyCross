@@ -453,6 +453,11 @@ extern void			GR_SetOverrideTextureSize(int width, int height, int offsetX, int 
 #if defined(PSYX_VITA)
 extern TextureID	GR_VitaPaletteTexture(int key, int* opaque);
 extern void		GR_VitaSetPaletteTexture(TextureID tex, int noDiscard);
+extern int			g_vitaForceLean;
+extern float		g_vitaLeanDim;
+extern int			GR_VitaBeamBegin(void);
+extern int			GR_VitaBeamClass(const GrVertex* v);
+extern float		GR_VitaBeamDim(void);
 #endif
 extern void			GR_SetWireframe(int enable);
 
@@ -470,6 +475,11 @@ extern void			GR_DrawTriangles(int start_vertex, int triangles);
  * GR_ShadowPassEnd(). Guarded by GR_FlashlightShadowActive(). */
 extern int			GR_FlashlightShadowActive(void);
 extern void			GR_ShadowPassBegin(void);
+#if defined(PSYX_VITA)
+extern int			GR_ShadowMapCurrent(unsigned casterHash);
+extern void			GR_ShadowMapWritten(unsigned casterHash);
+extern void			GR_ShadowMapKeep(void);
+#endif
 extern void			GR_ShadowPassDraw(int start_vertex, int num_verts);
 extern void			GR_ShadowPassEnd(void);
 

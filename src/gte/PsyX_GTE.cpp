@@ -354,7 +354,11 @@ namespace {
 #define TWIN_BITS 14
 #define TWIN_SIZE (1u << TWIN_BITS)
 #define TWIN_MASK (TWIN_SIZE - 1u)
+#if defined(__vita__)
+static inline unsigned TwinHash(uintptr_t k) { return (unsigned)((k >> 2) ^ ((k >> (TWIN_BITS + 2)) * 2654435761u)) & TWIN_MASK; }
+#else
 static inline unsigned TwinHash(uintptr_t k) { return (unsigned)((k >> 2) * 2654435761u) & TWIN_MASK; }
+#endif
 
 /* Matrix (rotation) twin: q12 = the nine Q12 coefficients as they live in the
  * MATRIX (the content key), exact = their unquantized doubles. valid=false is a
@@ -421,8 +425,8 @@ static MatTwin* MatSlotPut(uintptr_t k) {
 static MatTwin* MatSlotGet(uintptr_t k) {
 	unsigned gen = PGXP_CurGen(), s = TwinHash(k);
 	for (int i = 0; i < 16; ++i) { MatTwin* e = &s_matTwin[(s + i) & TWIN_MASK];
-		if (e->key == k) return (e->gen == gen) ? e : nullptr;
-		if (e->key == 0) return nullptr; }
+		if (e->key == 0 || e->gen != gen) return nullptr;
+		if (e->key == k) return e; }
 	return nullptr;
 }
 static TransTwin* TransSlotPut(uintptr_t k) {
@@ -434,8 +438,8 @@ static TransTwin* TransSlotPut(uintptr_t k) {
 static TransTwin* TransSlotGet(uintptr_t k) {
 	unsigned gen = PGXP_CurGen(), s = TwinHash(k);
 	for (int i = 0; i < 16; ++i) { TransTwin* e = &s_transTwin[(s + i) & TWIN_MASK];
-		if (e->key == k) return (e->gen == gen) ? e : nullptr;
-		if (e->key == 0) return nullptr; }
+		if (e->key == 0 || e->gen != gen) return nullptr;
+		if (e->key == k) return e; }
 	return nullptr;
 }
 static VecTwin* VecSlotPut(uintptr_t k) {
@@ -447,8 +451,8 @@ static VecTwin* VecSlotPut(uintptr_t k) {
 static VecTwin* VecSlotGet(uintptr_t k) {
 	unsigned gen = PGXP_CurGen(), s = TwinHash(k);
 	for (int i = 0; i < 16; ++i) { VecTwin* e = &s_vecTwin[(s + i) & TWIN_MASK];
-		if (e->key == k) return (e->gen == gen) ? e : nullptr;
-		if (e->key == 0) return nullptr; }
+		if (e->key == 0 || e->gen != gen) return nullptr;
+		if (e->key == k) return e; }
 	return nullptr;
 }
 

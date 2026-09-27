@@ -29,6 +29,7 @@
 #include <string.h>
 #if defined(__vita__)
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
 #endif
 
 #include <stdio.h>
@@ -228,8 +229,18 @@ int PsyX_Sys_GetVBlankCount()
 	return g_psxSysCounters[PsxCounter_VBLANK];
 }
 
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
+#endif
+
 int intrThreadMain(void* data)
 {
+#if defined(__vita__)
+	/* Core 3 with a core-unlock plugin, else core 2: the game thread owns core 0
+	 * and the render thread core 1. */
+	sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), VGLR_HelperCoreMask());
+#endif
 	timerCtx_t rcnt2Timer;
 	Util_InitHPCTimer(&g_vblTimer);
 	Util_InitHPCTimer(&rcnt2Timer);
@@ -1172,6 +1183,7 @@ extern "C" void (*g_PsyX_PostCaptureHook)(void) = NULL;
 #if defined(__vita__)
 extern "C" unsigned long long g_splitUs[4];
 extern "C" unsigned long long g_submitUs[4];
+extern "C" unsigned long long g_vitaBeamTris[2];
 extern "C" unsigned g_splitCause[8];
 extern "C" unsigned g_vitaPalCacheStats[3];
 extern "C" int g_vitaPalCache;
@@ -1299,6 +1311,7 @@ void PsyX_EndScene()
 			        g_vitaPalMinArea, g_vitaReorder, g_vitaPalCacheStats[0] / n, g_vitaPalCacheStats[1] / n, g_vitaPalCacheStats[2] / n);
 			memset(g_vitaPalCacheStats, 0, sizeof(g_vitaPalCacheStats));
 		}
+		VGLR_Report(n);
 		if (s_drainN)
 			eprintf("[GPUDRAIN] %u samples: gpu backlog avg=%.2f max=%.2f ms, swap after drain avg=%.2f ms\n",
 			        s_drainN, s_drainUs / (double)s_drainN / 1000.0, s_drainMaxUs / 1000.0,
@@ -1321,6 +1334,11 @@ void PsyX_EndScene()
 			        g_submitUs[0] / n / 1000.0, g_submitUs[1] / n / 1000.0,
 			        g_submitUs[2] / n / 1000.0, g_submitUs[3] / n / 1000.0);
 			memset(g_submitUs, 0, sizeof(g_submitUs));
+			if (g_vitaBeamTris[0] + g_vitaBeamTris[1])
+				eprintf("[BEAM] tris/frame: lit=%.0f plain=%.0f litPct=%.0f\n",
+				        g_vitaBeamTris[0] / n, g_vitaBeamTris[1] / n,
+				        100.0 * g_vitaBeamTris[0] / (double)(g_vitaBeamTris[0] + g_vitaBeamTris[1]));
+			memset(g_vitaBeamTris, 0, sizeof(g_vitaBeamTris));
 			eprintf("[SPLITCAUSE] per frame: blend=%.1f format=%.1f texture=%.1f depth=%.1f primMode=%.1f clip=%.1f dfe=%.1f other=%.1f\n",
 			        g_splitCause[0] / n, g_splitCause[1] / n, g_splitCause[2] / n, g_splitCause[3] / n,
 			        g_splitCause[4] / n, g_splitCause[5] / n, g_splitCause[6] / n, g_splitCause[7] / n);

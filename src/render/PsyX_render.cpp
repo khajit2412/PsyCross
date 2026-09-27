@@ -278,6 +278,7 @@ TextureID g_offscreenRTTexture = -1;
 TextureID g_whiteTexture = -1;
 #if defined(PSYX_VITA)
 extern "C" void GR_VitaPalCacheFrame(void);
+static unsigned s_vitaSceneNo = 0;
 #endif
 TextureID g_rgLutTexture = -1;
 TextureID g_lastBoundTexture = -1;
@@ -695,6 +696,88 @@ int   g_PsyX_FlashlightFpsMode      = 0;
  * now originates at the real chest/hand light (g_PsyX_FlashlightShadowPos), so no
  * artificial offset is needed; this is just an optional extra-parallax nudge. */
 float g_PsyX_FlashlightShadowFpsDrop = 0.0f;
+
+#if defined(PSYX_VITA)
+/* Beam-only lighting. Every layer of the painter-ordered scene is shaded, so
+ * running the flashlight shader over the whole screen cost several times the
+ * plain one. Triangles the beam provably cannot reach take the plain shader
+ * with the same flat dim the lit shader applies there (u_flDim). */
+int   g_vitaForceLean = 0;
+float g_vitaLeanDim   = 1.0f;
+int   g_vitaBeamCull  = 1;
+static struct { float o[3], d[3], cosA, sinA, range, dim; int on; } s_beam;
+
+int GR_VitaBeamBegin(void)
+{
+	float d[3] = { g_PsyX_FlashlightDir[0], g_PsyX_FlashlightDir[1], g_PsyX_FlashlightDir[2] };
+	float l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+
+	if (l2 > 1e-12f) { float il = 1.0f / sqrtf(l2); d[0] *= il; d[1] *= il; d[2] *= il; }
+	else { d[0] = 0.0f; d[1] = 0.0f; d[2] = 1.0f; }
+
+	const float size  = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightSizeFps : g_PsyX_FlashlightSize;
+	const float base  = g_PsyX_FlashlightStyle ? g_PsyX_FlashlightOuterCos : 0.82f;
+	float outer = 1.0f - size * (1.0f - base);
+	if (outer < 0.05f) outer = 0.05f;
+
+	const float back = g_PsyX_FlashlightStyle ? 39.0f : 0.0f;
+	for (int i = 0; i < 3; i++)
+	{
+		s_beam.d[i] = d[i];
+		s_beam.o[i] = g_PsyX_FlashlightPos[i] - d[i] * back;
+	}
+	s_beam.cosA  = outer;
+	s_beam.sinA  = sqrtf(1.0f - outer * outer);
+	/* Classic attenuates on twice the distance and reaches zero at the range. */
+	s_beam.range = g_PsyX_FlashlightStyle ? g_PsyX_FlashlightRange * 0.5f : g_PsyX_FlashlightRange;
+	s_beam.dim   = g_PsyX_FlashlightStyle ? 0.49f : 0.15f;
+	s_beam.on    = g_vitaBeamCull && g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive;
+	return s_beam.on;
+}
+
+float GR_VitaBeamDim(void)
+{
+	return s_beam.dim;
+}
+
+/* 0 = needs the lit shader, 1 = outside the beam (dim only), 2 = no view-space
+ * data (the lit shader neither dims nor lights it). Conservative: a bounding
+ * sphere against the cone and the range. */
+int GR_VitaBeamClass(const GrVertex* v)
+{
+	const int front = (v[0].vsz > 0.0f) + (v[1].vsz > 0.0f) + (v[2].vsz > 0.0f);
+
+	if (front == 0)
+		return 2;
+	if (front != 3)
+		return 0;
+
+	const float cx = (v[0].vsx + v[1].vsx + v[2].vsx) * (1.0f / 3.0f);
+	const float cy = (v[0].vsy + v[1].vsy + v[2].vsy) * (1.0f / 3.0f);
+	const float cz = (v[0].vsz + v[1].vsz + v[2].vsz) * (1.0f / 3.0f);
+	float r2 = 0.0f;
+	for (int i = 0; i < 3; i++)
+	{
+		const float ex = v[i].vsx - cx, ey = v[i].vsy - cy, ez = v[i].vsz - cz;
+		const float e2 = ex * ex + ey * ey + ez * ez;
+		if (e2 > r2) r2 = e2;
+	}
+	const float r  = sqrtf(r2);
+	const float px = cx - s_beam.o[0], py = cy - s_beam.o[1], pz = cz - s_beam.o[2];
+	const float len2 = px * px + py * py + pz * pz;
+	const float len  = sqrtf(len2);
+
+	if (len - r >= s_beam.range)
+		return 1;
+
+	const float a = px * s_beam.d[0] + py * s_beam.d[1] + pz * s_beam.d[2];
+	float perp2 = len2 - a * a;
+	if (perp2 < 0.0f) perp2 = 0.0f;
+	if (sqrtf(perp2) * s_beam.cosA - a * s_beam.sinA > r)
+		return 1;
+	return 0;
+}
+#endif
 float g_cfg_postProcessIntensity = 1.0f; /* post-process effect mix, 0..1 */
 float g_cfg_tonemapIntensity     = 1.0f; /* tonemap mix, 0..1 */
 
@@ -1908,6 +1991,7 @@ void GR_BeginScene()
 	g_lastBoundTexture = 0;
 #if defined(PSYX_VITA)
 	GR_VitaPalCacheFrame();
+	s_vitaSceneNo++;
 #endif
 
 #if USE_OPENGL
@@ -2006,6 +2090,7 @@ typedef struct
 	GLint voidProbeLoc;
 	GLint fogToBlackLoc;
 	GLint blendSrcLoc;
+	GLint flDimLoc;
 	GLint fogStrengthLoc;
 	GLint pgxpEnabledLoc;
 	GLint szMaxLoc;
@@ -2045,9 +2130,16 @@ static int s_compileNoFlashlight = 0;
 /* No-discard variants for textures with no transparent texel: a discard
  * anywhere in a shader turns off the PowerVR's hidden-surface removal for
  * everything it draws, so every overdrawn world pixel was fully shaded. */
-GTEShader g_lean_shader_32_opaque, g_gte_shader_32_opaque;
+GTEShader g_lean_shader_32_opaque;
 static int s_compileOpaque = 0;
 #endif
+/* The GPU sizes a program's registers for its worst path, so the lit shader
+ * carrying both flashlight styles and the shadow lookup ran every pixel at the
+ * occupancy of the heaviest one. Each style/shadow pairing is its own program,
+ * built the first time it is selected. Index: classic * 2 + shadows. */
+struct LitShaderSet { GTEShader s4, s8, s16, s32, s32o; int built; };
+static LitShaderSet s_litSets[4];
+static int s_compileLitVariant = -1;
 #endif
 
 #if USE_OPENGL
@@ -2067,6 +2159,7 @@ GLint u_voidProbeLoc;
 extern "C" int g_PsxVoidProbeArmed;
 GLint u_fogToBlackLoc;
 GLint u_blendSrcLoc;
+GLint u_flDimLoc = -1;
 GLint u_fogStrengthLoc;
 GLint u_pgxpEnabledLoc;
 GLint u_szMaxLoc;
@@ -2547,7 +2640,8 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 
 #if defined(PSYX_VITA)
 #	define GPU_BLEND_SRC_UNIFORM\
-	"	uniform vec2 u_blendSrc;\n"
+	"	uniform vec2 u_blendSrc;\n"\
+	"	uniform float u_flDim;\n"
 #	define GPU_BLEND_SRC_SCALE\
 	"		fragColor = vec4(fragColor.rgb * u_blendSrc.x, (u_blendSrc.y > 0.5) ? u_blendSrc.x : fragColor.a * u_blendSrc.x);\n"
 #else
@@ -2594,6 +2688,115 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
  * shadow, then fog - dither/quantize follows as the very last op. Shared so
  * override-drawn geometry matches the VRAM samplers exactly (missing fog on
  * override surfaces was visible as unfogged distant walls). */
+/* Vita: the shadow lookup is skipped where the beam adds nothing -- most of
+ * the screen, and the result is multiplied by zero there anyway. A 2x2 kernel
+ * was tried and gave no measurable speedup, only hard pixel-stepped edges. */
+#if defined(PSYX_VITA)
+#	define GPU_SHADOW_BEAM_GATE "cone * atten > 0.0"
+#else
+#	define GPU_SHADOW_BEAM_GATE "true"
+#endif
+#define GPU_SHADOW_PCF_LO    "-1"
+#define GPU_SHADOW_PCF_HI    "2"
+#define GPU_SHADOW_PCF_WY    "(sy == -1) ? (1.0 - texelFrac.y) : ((sy == 2) ? texelFrac.y : 1.0)"
+#define GPU_SHADOW_PCF_WX    "(sx == -1) ? (1.0 - texelFrac.x) : ((sx == 2) ? texelFrac.x : 1.0)"
+#define GPU_SHADOW_PCF_DIV   "9.0"
+
+#if defined(PSYX_VITA)
+#	define GPU_LEAN_DIM "#else\n		fragColor.rgb *= u_flDim;\n"
+#else
+#	define GPU_LEAN_DIM ""
+#endif
+
+/* Vita: u_flDir arrives normalized and u_flLightPos already holds the style's
+ * origin (GR_VitaBeamBegin), saving that per-pixel work on every lit fragment. */
+#if defined(PSYX_VITA)
+#	define GPU_FL_DIR_ORIGIN\
+	"				vec3 flDir = u_flDir;\n"\
+	"				vec3 flOrigin = u_flLightPos;\n"
+#else
+#	define GPU_FL_DIR_ORIGIN\
+	"				vec3 flDirRaw = u_flDir;\n"\
+	"				vec3 flDir = (dot(flDirRaw, flDirRaw) > 1e-12) ? normalize(flDirRaw) : vec3(0.0, 0.0, 1.0);\n"\
+	"				vec3 flOrigin = FL_CLASSIC ? (u_flLightPos - flDir * 39.0) : u_flLightPos;\n"
+#endif
+
+#if defined(PSYX_VITA)
+#	define GPU_FL_FACE_NORMAL\
+	"					vec3 flN = cross(dFdx(flP), dFdy(flP));\n"\
+	"					vec3 N = flN * inversesqrt(max(dot(flN, flN), 1e-18));\n"
+#else
+#	define GPU_FL_FACE_NORMAL\
+	"					vec3 flN = cross(dFdx(flP), dFdy(flP));\n"\
+	"					float nlen = length(flN);\n"\
+	"					vec3 N = (nlen > 1e-9) ? flN / nlen : vec3(0.0, 0.0, -1.0);\n"
+#endif
+
+/* Vita: the same bilinear-weighted 4x4 PCF, one row of four taps per vec4
+ * compare, run only where the kernel's four corners disagree: most lit pixels
+ * are wholly in or out of shadow and stop after four taps. Occluders thinner
+ * than the kernel (knobs, pipes) can fall between the corners and drop out,
+ * which suits the soft blob look. Fading shadows by occluder gap
+ * (u_shadowFadeDist) is left out. */
+#if defined(PSYX_VITA)
+#	define GPU_SHADOW_FILTER\
+	"							vec2 texelPos = luv.xy / u_shadowTexel - vec2(0.5);\n"\
+	"							vec2 texelBase = floor(texelPos);\n"\
+	"							vec2 f = texelPos - texelBase;\n"\
+	"							vec4 wx = vec4(1.0 - f.x, 1.0, 1.0, f.x);\n"\
+	"							vec4 wy = vec4(1.0 - f.y, 1.0, 1.0, f.y);\n"\
+	"							vec2 sb = (texelBase - vec2(0.5)) * u_shadowTexel;\n"\
+	"							vec4 ox = vec4(0.0, 1.0, 2.0, 3.0) * u_shadowTexel.x;\n"\
+	"							vec4 rzx = vec4(luv.z - u_shadowBias) + dzdu * (vec4(sb.x) + ox - vec4(luv.x));\n"\
+	"							float occ = 0.0;\n"\
+	"							float sb3 = sb.y + 3.0 * u_shadowTexel.y;\n"\
+	"							vec4 cz = vec4(shFetch(sb), shFetch(vec2(sb.x + ox.w, sb.y)), shFetch(vec2(sb.x, sb3)), shFetch(vec2(sb.x + ox.w, sb3)));\n"\
+	"							vec4 cr = rzx.xwxw + dzdv * (vec4(sb.y, sb.y, sb3, sb3) - vec4(luv.y));\n"\
+	"							float cs = dot(step(cz, cr), vec4(1.0));\n"\
+	"							if (cs > 3.5) occ = 9.0;\n"\
+	"							else if (cs > 0.5) {\n"\
+	"							{ float v = sb.y + 0.0 * u_shadowTexel.y;\n"\
+	"							vec4 sd = vec4(shFetch(vec2(sb.x, v)), shFetch(vec2(sb.x + ox.y, v)), shFetch(vec2(sb.x + ox.z, v)), shFetch(vec2(sb.x + ox.w, v)));\n"\
+	"							occ += wy.x * dot(wx, step(sd, rzx + dzdv * (v - luv.y))); }\n"\
+	"							{ float v = sb.y + 1.0 * u_shadowTexel.y;\n"\
+	"							vec4 sd = vec4(shFetch(vec2(sb.x, v)), shFetch(vec2(sb.x + ox.y, v)), shFetch(vec2(sb.x + ox.z, v)), shFetch(vec2(sb.x + ox.w, v)));\n"\
+	"							occ += wy.y * dot(wx, step(sd, rzx + dzdv * (v - luv.y))); }\n"\
+	"							{ float v = sb.y + 2.0 * u_shadowTexel.y;\n"\
+	"							vec4 sd = vec4(shFetch(vec2(sb.x, v)), shFetch(vec2(sb.x + ox.y, v)), shFetch(vec2(sb.x + ox.z, v)), shFetch(vec2(sb.x + ox.w, v)));\n"\
+	"							occ += wy.z * dot(wx, step(sd, rzx + dzdv * (v - luv.y))); }\n"\
+	"							{ float v = sb.y + 3.0 * u_shadowTexel.y;\n"\
+	"							vec4 sd = vec4(shFetch(vec2(sb.x, v)), shFetch(vec2(sb.x + ox.y, v)), shFetch(vec2(sb.x + ox.z, v)), shFetch(vec2(sb.x + ox.w, v)));\n"\
+	"							occ += wy.w * dot(wx, step(sd, rzx + dzdv * (v - luv.y))); }\n"\
+	"							}\n"\
+	"							shadow = 1.0 - u_shadowStrength * (occ / 9.0);\n"
+#else
+#	define GPU_SHADOW_FILTER\
+	"							float recvLin = (u_shadowFadeDist > 0.0) ? shLinDepth(luv.z) : 0.0;\n"\
+	"							float occ = 0.0;\n"\
+	"							vec2 texelPos = luv.xy / u_shadowTexel - vec2(0.5);\n"\
+	"							vec2 texelBase = floor(texelPos);\n"\
+	"							vec2 texelFrac = fract(texelPos);\n"\
+	"							for (int sy = " GPU_SHADOW_PCF_LO "; sy <= " GPU_SHADOW_PCF_HI "; sy++) {\n"\
+	"								float wy = " GPU_SHADOW_PCF_WY ";\n"\
+	"								for (int sx = " GPU_SHADOW_PCF_LO "; sx <= " GPU_SHADOW_PCF_HI "; sx++) {\n"\
+	"									float wx = " GPU_SHADOW_PCF_WX ";\n"\
+	"									float weight = wx * wy;\n"\
+	"									vec2 suv = (texelBase + vec2(float(sx), float(sy)) + vec2(0.5)) * u_shadowTexel;\n"\
+	"									float sd = shFetch(suv);\n"\
+	"									float receiverDepth = luv.z + dzdu * (suv.x - luv.x) + dzdv * (suv.y - luv.y);\n"\
+	"									if (receiverDepth - u_shadowBias > sd) {\n"\
+	"										if (u_shadowFadeDist > 0.0) {\n"\
+	"											float gap = recvLin - shLinDepth(sd);\n"\
+	"											occ += weight * (1.0 - clamp(gap / u_shadowFadeDist, 0.0, 1.0));\n"\
+	"										} else {\n"\
+	"											occ += weight;\n"\
+	"										}\n"\
+	"									}\n"\
+	"								}\n"\
+	"							}\n"\
+	"							shadow = 1.0 - u_shadowStrength * (occ / " GPU_SHADOW_PCF_DIV ");\n"
+#endif
+
 #define GPU_LIT_TAIL\
 	"		vec3 flAlbedo = fragColor.rgb;\n"\
 	"		fragColor *= v_color;\n"\
@@ -2608,25 +2811,26 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"		if (u_untextured > 0 || " GPU_UNTEX_VERTEX ") flAlbedo = fragColor.rgb;\n"\
 	/* Two flashlight styles, chosen by the UNIFORM u_flStyle (uniform control flow, so derivative use inside the branch is well-defined). 1 = CLASSIC: PSX-calibrated orientation-independent overlay -- no face normals, func_80057658-derived falloff, eased wide cone, 0.49 base dim. 0 = MODERN: stylized spotlight -- per-fragment Lambert from a dFdx/dFdy-reconstructed face normal, linear falloff, hard 0.15 dark surround. */\
 	"#ifndef PSYX_NO_FLASHLIGHT\n"\
+	"#ifndef FL_CLASSIC\n"\
+	"#define FL_CLASSIC (u_flStyle > 0)\n"\
+	"#endif\n"\
 	"		if (u_flashlightOn > 0) {\n"\
 	"			vec3 flP = v_viewpos;\n"\
 	"			if (flP.z > 0.0) {\n"\
-	"				fragColor.rgb *= (u_flStyle > 0) ? 0.49 : 0.15;\n"\
+	"				fragColor.rgb *= FL_CLASSIC ? 0.49 : 0.15;\n"\
 	/* normalize() of a zero vector is 0/0 = NaN, and a NaN here propagates through
 	 * dot/smoothstep into the += below, wiping the cone while the dim above has
 	 * already landed -- a dark scene with no beam. Desktop drivers commonly flush
 	 * that to zero; ANGLE -> Vulkan does not, which is why the same build lights
 	 * correctly on one backend and not the other. Guard the degenerate case. */\
-	"				vec3 flDirRaw = u_flDir;\n"\
-	"				vec3 flDir = (dot(flDirRaw, flDirRaw) > 1e-12) ? normalize(flDirRaw) : vec3(0.0, 0.0, 1.0);\n"\
-	"				vec3 flOrigin = (u_flStyle > 0) ? (u_flLightPos - flDir * 39.0) : u_flLightPos;\n"\
+	GPU_FL_DIR_ORIGIN\
 	"				vec3 L = flOrigin - flP;\n"\
 	"				float d = length(L);\n"\
 	"				L /= max(d, 0.0001);\n"\
 	"				float cone  = smoothstep(u_flOuterCos, u_flInnerCos, dot(-L, flDir));\n"\
 	"				float ndl = 1.0;\n"\
 	"				float atten;\n"\
-	"				if (u_flStyle > 0) {\n"\
+	"				if (FL_CLASSIC) {\n"\
 	"					cone = cone * (2.0 - cone);\n"\
 	/* Classic center-beam distance envelope derived from SH1's func_80057658 at full Q12 flashlight strength: its GTE projection reduces to a capped 1/d term plus a thresholded 1/d^2 term, normalized by the room-light cap. */\
 	"					float attenD = d * 2.0;\n"\
@@ -2637,16 +2841,17 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"					atten *= 1.0 - smoothstep(u_flRange * 0.9, u_flRange, attenD);\n"\
 	"				} else {\n"\
 	/* Modern: GrVertex carries no usable normals, so the face normal is reconstructed from the view-space position gradient -- exact per triangle face, no GTE-side capture needed. The N.L term gives surfaces 3D shape under the beam. */\
-	"					vec3 flN = cross(dFdx(flP), dFdy(flP));\n"\
-	"					float nlen = length(flN);\n"\
-	"					vec3 N = (nlen > 1e-9) ? flN / nlen : vec3(0.0, 0.0, -1.0);\n"\
+	"					atten = clamp(1.0 - d / u_flRange, 0.0, 1.0);\n"\
+	"					if (" GPU_SHADOW_BEAM_GATE ") {\n"\
+	GPU_FL_FACE_NORMAL\
 	"					if (dot(N, flP) > 0.0) N = -N;\n"\
 	"					ndl = 0.15 + 0.85 * max(dot(N, L), 0.0);\n"\
-	"					atten = clamp(1.0 - d / u_flRange, 0.0, 1.0);\n"\
+	"					}\n"\
 	"				}\n"\
 	/* Bilinearly interpolated 3x3 PCF avoids kernel jumps as the projected receiver crosses shadow texels. */\
 	"				float shadow = 1.0;\n"\
-	"				if (u_shadowOn > 0) {\n"\
+	"#ifndef PSYX_NO_SHADOW\n"\
+	"				if (u_shadowOn > 0 && " GPU_SHADOW_BEAM_GATE ") {\n"\
 	/* Perspective-correct shadow receiver (PR#8): correctness for BOTH styles -- same shadow shapes, just stable under motion. */\
 	"					vec3 flShadowP = v_shadowViewPos.xyz / max(v_shadowViewPos.w, 1e-9);\n"\
 	"					vec3 flPs = flShadowP + L * (u_shadowNormalOffset * d);\n"\
@@ -2663,37 +2868,16 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"								dzdu = (luvDx.z * luvDy.y - luvDy.z * luvDx.y) / det;\n"\
 	"								dzdv = (luvDy.z * luvDx.x - luvDx.z * luvDy.x) / det;\n"\
 	"							}\n"\
-	"							float recvLin = (u_shadowFadeDist > 0.0) ? shLinDepth(luv.z) : 0.0;\n"\
-	"							float occ = 0.0;\n"\
-	"							vec2 texelPos = luv.xy / u_shadowTexel - vec2(0.5);\n"\
-	"							vec2 texelBase = floor(texelPos);\n"\
-	"							vec2 texelFrac = fract(texelPos);\n"\
-	"							for (int sy = -1; sy <= 2; sy++) {\n"\
-	"								float wy = (sy == -1) ? (1.0 - texelFrac.y) : ((sy == 2) ? texelFrac.y : 1.0);\n"\
-	"								for (int sx = -1; sx <= 2; sx++) {\n"\
-	"									float wx = (sx == -1) ? (1.0 - texelFrac.x) : ((sx == 2) ? texelFrac.x : 1.0);\n"\
-	"									float weight = wx * wy;\n"\
-	"									vec2 suv = (texelBase + vec2(float(sx), float(sy)) + vec2(0.5)) * u_shadowTexel;\n"\
-	"									float sd = shFetch(suv);\n"\
-	"									float receiverDepth = luv.z + dzdu * (suv.x - luv.x) + dzdv * (suv.y - luv.y);\n"\
-	"									if (receiverDepth - u_shadowBias > sd) {\n"\
-	"										if (u_shadowFadeDist > 0.0) {\n"\
-	"											float gap = recvLin - shLinDepth(sd);\n"\
-	"											occ += weight * (1.0 - clamp(gap / u_shadowFadeDist, 0.0, 1.0));\n"\
-	"										} else {\n"\
-	"											occ += weight;\n"\
-	"										}\n"\
-	"									}\n"\
-	"								}\n"\
-	"							}\n"\
-	"							shadow = 1.0 - u_shadowStrength * (occ / 9.0);\n"\
+	GPU_SHADOW_FILTER\
 	"						}\n"\
 	"					}\n"\
 	"				}\n"\
+	"#endif\n"\
 	"				vec3 fl = u_flColor * (cone * atten * ndl * shadow);\n"\
 	"				fragColor.rgb += flAlbedo * fl * (1.0 - clamp(v_fade, 0.0, 1.0));\n"\
 	"			}\n"\
 	"		}\n"\
+	GPU_LEAN_DIM\
 	"#endif\n"\
 	"		float fogAmt = clamp(v_fogAmount * u_fogStrength, 0.0, 1.0);\n"\
 	/* Plain PSX fog: the ramp reaches full fog at the map's fog distance and the
@@ -3159,6 +3343,12 @@ ShaderID GR_Shader_Compile(const char* source)
 		strcat(extra_fs_defines, "#define PSYX_NO_FLASHLIGHT\n");
 	if (s_compileOpaque)
 		strcat(extra_fs_defines, "#define PSYX_OPAQUE_TEX\n");
+	if (s_compileLitVariant >= 0)
+	{
+		strcat(extra_fs_defines, (s_compileLitVariant & 2) ? "#define FL_CLASSIC true\n" : "#define FL_CLASSIC false\n");
+		if (!(s_compileLitVariant & 1))
+			strcat(extra_fs_defines, "#define PSYX_NO_SHADOW\n");
+	}
 #endif
 #endif
 
@@ -3336,6 +3526,7 @@ static void GR_InitialisePSXShader(GTEShader* sh, ShaderID shader)
 	sh->voidProbeLoc = glGetUniformLocation(sh->shader, "u_voidProbe");
 	sh->fogToBlackLoc = glGetUniformLocation(sh->shader, "u_fogToBlack");
 	sh->blendSrcLoc = glGetUniformLocation(sh->shader, "u_blendSrc");
+	sh->flDimLoc = glGetUniformLocation(sh->shader, "u_flDim");
 	sh->fogStrengthLoc = glGetUniformLocation(sh->shader, "u_fogStrength");
 	sh->pgxpEnabledLoc = glGetUniformLocation(sh->shader, "u_pgxpEnabled");
 	sh->szMaxLoc = glGetUniformLocation(sh->shader, "u_szMax");
@@ -3401,12 +3592,39 @@ void GR_CompilePSXShader(GTEShader* sh, const char* source)
 extern "C" void Pc_ModernShader_Initialise(const char*, const char*, const char*, const char*);
 extern "C" ShaderID Pc_ModernShader_Get(TexFormat);
 
+#if defined(PSYX_VITA)
+static LitShaderSet* GR_VitaLitSet(void)
+{
+	const int idx = (g_PsyX_FlashlightStyle ? 2 : 0) | (g_PsyX_UseFlashlightShadows ? 1 : 0);
+	LitShaderSet* set = &s_litSets[idx];
+
+	if (!set->built)
+	{
+		s_compileLitVariant = idx;
+		GR_CompilePSXShader(&set->s4, gte_shader_4);
+		GR_CompilePSXShader(&set->s8, gte_shader_8);
+		GR_CompilePSXShader(&set->s16, gte_shader_16);
+		GR_CompilePSXShader(&set->s32, gte_shader_32_rgba);
+		s_compileOpaque = 1;
+		GR_CompilePSXShader(&set->s32o, gte_shader_32_rgba);
+		s_compileOpaque = 0;
+		s_compileLitVariant = -1;
+		set->built = 1;
+		g_PreviousShader = (ShaderID)-1;
+		eprintf("[LITSHADER] built style=%s shadows=%d\n", (idx & 2) ? "classic" : "modern", idx & 1);
+	}
+	return set;
+}
+#endif
+
 void GR_InitialisePSXShaders()
 {
+#if !defined(PSYX_VITA)
 	GR_CompilePSXShader(&g_gte_shader_4, gte_shader_4);
 	GR_CompilePSXShader(&g_gte_shader_8, gte_shader_8);
 	GR_CompilePSXShader(&g_gte_shader_16, gte_shader_16);
 	GR_CompilePSXShader(&g_gte_shader_32_rgba, gte_shader_32_rgba);
+#endif
 #if defined(PSYX_VITA)
 	s_compileNoFlashlight = 1;
 	GR_CompilePSXShader(&g_lean_shader_4, gte_shader_4);
@@ -3416,8 +3634,9 @@ void GR_InitialisePSXShaders()
 	s_compileOpaque = 1;
 	GR_CompilePSXShader(&g_lean_shader_32_opaque, gte_shader_32_rgba);
 	s_compileNoFlashlight = 0;
-	GR_CompilePSXShader(&g_gte_shader_32_opaque, gte_shader_32_rgba);
 	s_compileOpaque = 0;
+	if (g_PsyX_UsePerPixelFlashlight)
+		GR_VitaLitSet();
 #endif
 	Pc_ModernShader_Initialise(gte_shader_4, gte_shader_8, gte_shader_16, gte_shader_32_rgba);
 	GR_InitialisePSXShader(&g_modern_shader_4, Pc_ModernShader_Get(TF_4_BIT));
@@ -3794,6 +4013,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
 		u_blendSrcLoc = shader->blendSrcLoc;
+		u_flDimLoc = shader->flDimLoc;
 		u_fogStrengthLoc = shader->fogStrengthLoc;
 		u_pgxpEnabledLoc = shader->pgxpEnabledLoc;
 		u_szMaxLoc = shader->szMaxLoc;
@@ -3833,6 +4053,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
 		u_blendSrcLoc = shader->blendSrcLoc;
+		u_flDimLoc = shader->flDimLoc;
 		u_fogStrengthLoc = shader->fogStrengthLoc;
 		u_pgxpEnabledLoc = shader->pgxpEnabledLoc;
 		u_szMaxLoc = shader->szMaxLoc;
@@ -3872,6 +4093,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
 		u_blendSrcLoc = shader->blendSrcLoc;
+		u_flDimLoc = shader->flDimLoc;
 		u_fogStrengthLoc = shader->fogStrengthLoc;
 		u_pgxpEnabledLoc = shader->pgxpEnabledLoc;
 		u_szMaxLoc = shader->szMaxLoc;
@@ -3916,6 +4138,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		u_voidProbeLoc = shader->voidProbeLoc;
 		u_fogToBlackLoc = shader->fogToBlackLoc;
 		u_blendSrcLoc = shader->blendSrcLoc;
+		u_flDimLoc = shader->flDimLoc;
 		u_fogStrengthLoc = shader->fogStrengthLoc;
 		u_pgxpEnabledLoc = shader->pgxpEnabledLoc;
 		u_szMaxLoc = shader->szMaxLoc;
@@ -3974,6 +4197,10 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 
 	if (u_fogStrengthLoc != -1)
 		glUniform1f(u_fogStrengthLoc, g_PsyX_FogStrength);
+#if defined(PSYX_VITA)
+	if (u_flDimLoc != -1)
+		glUniform1f(u_flDimLoc, g_vitaLeanDim);
+#endif
 
 	/* Per-pixel flashlight cone. u_flashlightOn is 0 unless BOTH the master
 	 * config flag and the per-frame game push are set, so the OFF path never
@@ -3989,8 +4216,13 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		glUniform1i(u_untexturedLoc, texture == g_whiteTexture ? 1 : 0);
 	if (u_flStyleLoc != -1)
 		glUniform1i(u_flStyleLoc, g_PsyX_FlashlightStyle ? 1 : 0);
+#if defined(PSYX_VITA)
+	if (u_flLightPosLoc != -1)
+		glUniform3fv(u_flLightPosLoc, 1, s_beam.o);
+#else
 	if (u_flLightPosLoc != -1)
 		glUniform3fv(u_flLightPosLoc, 1, g_PsyX_FlashlightPos);
+#endif
 
 	/* The cone collapses if any of these is degenerate -- a zero direction most of
 	 * all. Reported on change so a backend that lights wrongly can be compared
@@ -4014,8 +4246,13 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 			        g_PsyX_FlashlightRange, g_PsyX_FlashlightStyle);
 		}
 	}
+#if defined(PSYX_VITA)
+	if (u_flDirLoc != -1)
+		glUniform3fv(u_flDirLoc, 1, s_beam.d);
+#else
 	if (u_flDirLoc != -1)
 		glUniform3fv(u_flDirLoc, 1, g_PsyX_FlashlightDir);
+#endif
 	/* FPS mode swaps in its own (tighter/dimmer) cone size + brightness. */
 	float flIntensityActive = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightIntensityFps : g_PsyX_FlashlightIntensity;
 	float flSizeActive      = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightSizeFps      : g_PsyX_FlashlightSize;
@@ -4205,12 +4442,21 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 {
 	GTEShader* shader;
 #if defined(PSYX_VITA)
-	if (!(g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive))
+	if (g_vitaForceLean || !(g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive))
 	{
 		if (texFormat == TF_4_BIT) shader = &g_lean_shader_4;
 		else if (texFormat == TF_8_BIT) shader = &g_lean_shader_8;
 		else if (texFormat == TF_16_BIT) shader = &g_lean_shader_16;
 		else shader = &g_lean_shader_32_rgba;
+		GR_SetTextureShader(texture, texFormat, shader);
+		return;
+	}
+	{
+		LitShaderSet* set = GR_VitaLitSet();
+		if (texFormat == TF_4_BIT) shader = &set->s4;
+		else if (texFormat == TF_8_BIT) shader = &set->s8;
+		else if (texFormat == TF_16_BIT) shader = &set->s16;
+		else shader = &set->s32;
 		GR_SetTextureShader(texture, texFormat, shader);
 		return;
 	}
@@ -4483,12 +4729,12 @@ TextureID GR_VitaPaletteTexture(int key, int* opaque)
 void GR_VitaSetPaletteTexture(TextureID tex, int noDiscard)
 {
 	GTEShader* shader;
-	const int lean = !(g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive);
+	const int lean = g_vitaForceLean || !(g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive);
 
-	if (noDiscard)
-		shader = lean ? &g_lean_shader_32_opaque : &g_gte_shader_32_opaque;
+	if (lean)
+		shader = noDiscard ? &g_lean_shader_32_opaque : &g_lean_shader_32_rgba;
 	else
-		shader = lean ? &g_lean_shader_32_rgba : &g_gte_shader_32_rgba;
+		shader = noDiscard ? &GR_VitaLitSet()->s32o : &GR_VitaLitSet()->s32;
 	GR_SetTextureShader(tex, TF_32_BIT_RGBA, shader);
 	GR_SetOverrideTextureSize(256, 256, 0, 0, 256, 256);
 }
@@ -6032,6 +6278,68 @@ static void GR_EnsureShadowTarget(void)
 	}
 }
 
+#if defined(PSYX_VITA)
+/* The shadow light follows the flashlight loosely: Harry's breathing and walk
+ * sway moved every shadow edge across the 256 map's large texels each frame
+ * (the flicker). Movement inside a small dead zone is ignored and larger moves
+ * are eased in; a jump (camera cut, room change) snaps. The beam itself still
+ * uses the exact flashlight. An unchanged light also lets an unchanged map be
+ * reused (GR_ShadowMapCurrent). */
+#define SHADOW_STEADY_POS    10.0f    /* view units */
+#define SHADOW_STEADY_COS    0.9996f  /* ~1.6 degrees */
+#define SHADOW_STEADY_EASE   0.35f
+#define SHADOW_STEADY_SNAP   600.0f
+#define SHADOW_STEADY_SNAPCOS 0.85f
+static float    s_stEye[3], s_stDir[3];
+static int      s_stValid = 0;
+static unsigned s_stScene = 0;
+
+static void GR_VitaSteadyShadowLight(float eye[3], float dir[3])
+{
+	if (!s_stValid || s_stScene == s_vitaSceneNo)
+	{
+		if (!s_stValid)
+		{
+			memcpy(s_stEye, eye, sizeof(s_stEye));
+			memcpy(s_stDir, dir, sizeof(s_stDir));
+			s_stValid = 1;
+			s_stScene = s_vitaSceneNo;
+		}
+		memcpy(eye, s_stEye, sizeof(s_stEye));
+		memcpy(dir, s_stDir, sizeof(s_stDir));
+		return;
+	}
+	s_stScene = s_vitaSceneNo;
+
+	const float dx = eye[0] - s_stEye[0], dy = eye[1] - s_stEye[1], dz = eye[2] - s_stEye[2];
+	const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+	const float c = sh_dot3(dir, s_stDir);
+
+	if (dist > SHADOW_STEADY_SNAP || c < SHADOW_STEADY_SNAPCOS)
+	{
+		memcpy(s_stEye, eye, sizeof(s_stEye));
+		memcpy(s_stDir, dir, sizeof(s_stDir));
+	}
+	else
+	{
+		if (dist > SHADOW_STEADY_POS)
+		{
+			s_stEye[0] += dx * SHADOW_STEADY_EASE;
+			s_stEye[1] += dy * SHADOW_STEADY_EASE;
+			s_stEye[2] += dz * SHADOW_STEADY_EASE;
+		}
+		if (c < SHADOW_STEADY_COS)
+		{
+			for (int i = 0; i < 3; i++)
+				s_stDir[i] += (dir[i] - s_stDir[i]) * SHADOW_STEADY_EASE;
+			sh_normalize3(s_stDir);
+		}
+	}
+	memcpy(eye, s_stEye, sizeof(s_stEye));
+	memcpy(dir, s_stDir, sizeof(s_stDir));
+}
+#endif
+
 static void GR_BuildShadowMatrix(void)
 {
 	float sizeActive = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightSizeFps : g_PsyX_FlashlightSize;
@@ -6067,6 +6375,9 @@ static void GR_BuildShadowMatrix(void)
 		eye[1] -= dir[1] * g_PsyX_FlashlightShadowFpsDrop;
 		eye[2] -= dir[2] * g_PsyX_FlashlightShadowFpsDrop;
 	}
+#if defined(PSYX_VITA)
+	GR_VitaSteadyShadowLight(eye, dir);
+#endif
 	float center[3] = { eye[0] + dir[0], eye[1] + dir[1], eye[2] + dir[2] };
 
 	float up[3] = { 0.0f, 1.0f, 0.0f };
@@ -6094,10 +6405,42 @@ int GR_FlashlightShadowActive(void)
 static GLint s_shadowPrevFBO = 0;
 static GLint s_shadowPrevViewport[4] = { 0, 0, 0, 0 };
 
+#if defined(PSYX_VITA)
+static float    s_mapMatrix[16];
+static unsigned s_mapCasterHash = 0;
+static int      s_mapValid = 0;
+
+/* Builds this flush's light matrix. Returns 1 when the map already holds
+ * exactly these casters from this light, so the pass can be skipped. */
+int GR_ShadowMapCurrent(unsigned casterHash)
+{
+	GR_BuildShadowMatrix();
+	return s_mapValid && g_shadowFBO != 0 && casterHash == s_mapCasterHash &&
+	       memcmp(s_mapMatrix, g_shadowLightMatrix, sizeof(s_mapMatrix)) == 0;
+}
+
+/* A flush with no casters draws no pass: its receivers read the map that is
+ * there, so they must use the light it was rendered from. */
+void GR_ShadowMapKeep(void)
+{
+	if (s_mapValid)
+		memcpy(g_shadowLightMatrix, s_mapMatrix, sizeof(s_mapMatrix));
+}
+
+void GR_ShadowMapWritten(unsigned casterHash)
+{
+	memcpy(s_mapMatrix, g_shadowLightMatrix, sizeof(s_mapMatrix));
+	s_mapCasterHash = casterHash;
+	s_mapValid = 1;
+}
+#endif
+
 void GR_ShadowPassBegin(void)
 {
 	GR_EnsureShadowTarget();
+#if !defined(PSYX_VITA)
 	GR_BuildShadowMatrix();
+#endif
 
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s_shadowPrevFBO);
 	glGetIntegerv(GL_VIEWPORT, s_shadowPrevViewport);

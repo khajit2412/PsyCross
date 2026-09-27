@@ -81,7 +81,14 @@ static ShadowEntry s_shadow[SHADOW_SIZE];
 #endif
 
 static inline unsigned ShadowHash(uintptr_t k) {
+#if defined(__vita__)
+	/* Keys are prim-field / scratch addresses written in sequence; keeping the low
+	 * bits linear makes consecutive vertices share cache lines instead of each
+	 * store, copy and lookup missing to DRAM. Only the block above is scrambled. */
+	return (unsigned)((k >> 2) ^ ((k >> (SHADOW_BITS + 2)) * 2654435761u)) & SHADOW_MASK;
+#else
 	return (unsigned)((k >> 2) * 2654435761u) & SHADOW_MASK;
+#endif
 }
 
 static void Shadow_Put(void* addr, float x, float y, float w, unsigned value) {
@@ -112,8 +119,9 @@ static const ShadowEntry* Shadow_Get(const void* addr) {
 	unsigned s = ShadowHash(k);
 	for (int i = 0; i < 16; i++) {
 		const ShadowEntry* e = &s_shadow[(s + i) & SHADOW_MASK];
-		if (e->key == k) return (e->gen == s_pgxpGen) ? e : nullptr;
-		if (e->key == 0) return nullptr;
+		/* Put claims the first stale slot, so a stale slot ends the chain. */
+		if (e->key == 0 || e->gen != s_pgxpGen) return nullptr;
+		if (e->key == k) return e;
 	}
 	return nullptr;
 }
@@ -193,8 +201,8 @@ static const VsEntry* Vs_Get(const void* addr, unsigned value) {
 	unsigned s = ShadowHash(k);
 	for (int i = 0; i < 16; i++) {
 		const VsEntry* e = &s_vshadow[(s + i) & SHADOW_MASK];
-		if (e->key == k) return (e->gen == s_pgxpGen && e->value == value) ? e : nullptr;
-		if (e->key == 0) return nullptr;
+		if (e->key == 0 || e->gen != s_pgxpGen) return nullptr;
+		if (e->key == k) return (e->value == value) ? e : nullptr;
 	}
 	return nullptr;
 }
@@ -3037,6 +3045,18 @@ extern "C" { unsigned long long g_splitUs[4]; unsigned long long g_submitUs[4]; 
 #define SPLIT_T() 0ULL
 #endif
 
+/* The vertices this flush draws from: g_vertexBuffer, or on Vita the reordered
+ * copy Vita_ReorderSplits wrote (saves copying it back). */
+static GrVertex* s_drawVerts = g_vertexBuffer;
+
+#if defined(__vita__)
+#define VITA_BEAM_MIN_RUN  8
+#define VITA_BEAM_MAX_TRIS 16384
+static int s_beamOn = 0;
+static unsigned char s_beamClass[VITA_BEAM_MAX_TRIS];
+extern "C" { unsigned long long g_vitaBeamTris[2]; }
+#endif
+
 void DrawSplit(const GPUDrawSplit& split)
 {
 	const bool isAdditive = (split.blendMode == BM_ADD || split.blendMode == BM_ADD_QUATER_SOURCE);
@@ -3070,41 +3090,88 @@ void DrawSplit(const GPUDrawSplit& split)
 #if defined(__vita__)
 	int palOpaque = 0;
 	TextureID palTex = split.palKey ? GR_VitaPaletteTexture(split.palKey, &palOpaque) : 0;
-	if (palTex != 0)
-		GR_VitaSetPaletteTexture(palTex, palOpaque && split.blendMode == BM_NONE);
-	else
 #endif
-	GR_SetTexture(split.textureId, split.texFormat);
+	const bool drawOnScreen = split.drawenv.dfe;
 
-	if (split.texFormat == TF_32_BIT_RGBA)
-		GR_SetOverrideTextureSize(split.drawenv.tw.w, split.drawenv.tw.h,
-		                          split.drawenv.tw.x, split.drawenv.tw.y,
-		                          split.overrideHiresW, split.overrideHiresH);
+	/* Program, then the state that uploads into it. Re-run when a split's
+	 * triangles alternate between the lit and the plain flashlight shader. */
+	auto bindState = [&]()
+	{
+#if defined(__vita__)
+		if (palTex != 0)
+			GR_VitaSetPaletteTexture(palTex, palOpaque && split.blendMode == BM_NONE);
+		else
+#endif
+		GR_SetTexture(split.textureId, split.texFormat);
+
+		if (split.texFormat == TF_32_BIT_RGBA)
+			GR_SetOverrideTextureSize(split.drawenv.tw.w, split.drawenv.tw.h,
+			                          split.drawenv.tw.x, split.drawenv.tw.y,
+			                          split.overrideHiresW, split.overrideHiresH);
+
+		GR_SetupClipMode(&split.drawenv.clip, drawOnScreen);
+		GR_SetOffscreenState(&split.drawenv.clip, !drawOnScreen);
+		GR_SetBlendMode(split.blendMode);
+
+		/* PGXP coplanar fix (docs/PGXP_PR51_Vetting.md): draw static-world opaque
+		 * geometry with GL_ALWAYS instead of GL_LEQUAL, keeping GR_SetBlendMode's
+		 * depth test+write on. Coplanar world faces then resolve by painter (OT)
+		 * order among themselves — no z-fight — while still leaving a per-pixel depth
+		 * buffer that actors/effects LEQUAL-test against. Every on-path split sets the
+		 * func explicitly, so a world split's GL_ALWAYS can't leak onto the next.
+		 * Gate is folded into the arg (not an `if`) so a runtime PGXP on->off toggle
+		 * still self-heals GL_ALWAYS back to LEQUAL on the first off frame; on steady
+		 * off the cache is already 0 and GR_SetDepthFuncAlways early-returns without
+		 * touching glDepthFunc, so pixels stay byte-identical. (depthMode is always
+		 * DISABLED when off.) */
+		GR_SetDepthFuncAlways(g_PsxUsePgxp && g_PsxWorldDepthAlways &&
+		                      split.depthMode == SPLIT_DEPTH_WORLD && split.blendMode == BM_NONE);
+
+		if (g_PsxDbgAddMode == 2 && isAdditive)
+			GR_EnableDepth(1);
+	};
+
+#if defined(__vita__)
+	const int nTris = split.numVerts / 3;
+	int beamRuns = 0;
+	if (s_beamOn && nTris >= VITA_BEAM_MIN_RUN && nTris <= VITA_BEAM_MAX_TRIS)
+	{
+		const GrVertex* v = &s_drawVerts[split.startVertex];
+		int lit = 0;
+		for (int i = 0; i < nTris; i++)
+		{
+			s_beamClass[i] = (unsigned char)GR_VitaBeamClass(&v[i * 3]);
+			lit += (s_beamClass[i] == 0);
+		}
+		/* Short plain runs between lit ones cost a program switch each for
+		 * little fill saved; the lit shader draws them identically. */
+		for (int i = 0; i < nTris; )
+		{
+			int j = i + 1;
+			while (j < nTris && (s_beamClass[j] != 0) == (s_beamClass[i] != 0))
+				j++;
+			if (s_beamClass[i] != 0 && j - i < VITA_BEAM_MIN_RUN)
+			{
+				memset(&s_beamClass[i], 0, j - i);
+				lit += j - i;
+			}
+			i = j;
+		}
+		if (lit != nTris)
+			beamRuns = 1;
+		g_vitaBeamTris[0] += lit;
+		g_vitaBeamTris[1] += nTris - lit;
+	}
+	else if (s_beamOn)
+		g_vitaBeamTris[0] += nTris;
+#endif
 
 	unsigned long long t2 = SPLIT_T();
-	const bool drawOnScreen = split.drawenv.dfe;
-	GR_SetupClipMode(&split.drawenv.clip, drawOnScreen);
-	GR_SetOffscreenState(&split.drawenv.clip, !drawOnScreen);
-
-	unsigned long long t3 = SPLIT_T();
-	GR_SetBlendMode(split.blendMode);
-
-	/* PGXP coplanar fix (docs/PGXP_PR51_Vetting.md): draw static-world opaque
-	 * geometry with GL_ALWAYS instead of GL_LEQUAL, keeping GR_SetBlendMode's
-	 * depth test+write on. Coplanar world faces then resolve by painter (OT)
-	 * order among themselves — no z-fight — while still leaving a per-pixel depth
-	 * buffer that actors/effects LEQUAL-test against. Every on-path split sets the
-	 * func explicitly, so a world split's GL_ALWAYS can't leak onto the next.
-	 * Gate is folded into the arg (not an `if`) so a runtime PGXP on->off toggle
-	 * still self-heals GL_ALWAYS back to LEQUAL on the first off frame; on steady
-	 * off the cache is already 0 and GR_SetDepthFuncAlways early-returns without
-	 * touching glDepthFunc, so pixels stay byte-identical. (depthMode is always
-	 * DISABLED when off.) */
-	GR_SetDepthFuncAlways(g_PsxUsePgxp && g_PsxWorldDepthAlways &&
-	                      split.depthMode == SPLIT_DEPTH_WORLD && split.blendMode == BM_NONE);
-
-	if (g_PsxDbgAddMode == 2 && isAdditive)
-		GR_EnableDepth(1);
+#if defined(__vita__)
+	if (!beamRuns)
+#endif
+	bindState();
+	unsigned long long t3 = t2;
 
 	/* [ITEMDEPTH] sample the REAL GL depth state for the splits that actually
 	 * rasterize probed item primitives — after all state setup, immediately
@@ -3118,14 +3185,35 @@ void DrawSplit(const GPUDrawSplit& split)
 	}
 
 	unsigned long long t4 = SPLIT_T();
+#if defined(__vita__)
+	if (beamRuns)
+	{
+		const float dim = GR_VitaBeamDim();
+		for (int i = 0; i < nTris; )
+		{
+			const unsigned char c = s_beamClass[i];
+			int j = i + 1;
+			while (j < nTris && s_beamClass[j] == c)
+				j++;
+			g_vitaForceLean = (c != 0);
+			g_vitaLeanDim   = (c == 1) ? dim : 1.0f;
+			bindState();
+			GR_DrawTriangles(split.startVertex + i * 3, j - i);
+			i = j;
+		}
+		g_vitaForceLean = 0;
+		g_vitaLeanDim   = 1.0f;
+	}
+	else
+#endif
 	GR_DrawTriangles(split.startVertex, split.numVerts / 3);
 
 #if defined(__vita__)
 	{
 		const unsigned long long t5 = SPLIT_T();
-		g_splitUs[0] += t2 - t1;
-		g_splitUs[1] += t3 - t2;
-		g_splitUs[2] += (t1 - t0) + (t4 - t3);
+		g_splitUs[0] += t3 - t1;
+		g_splitUs[1] += 0;
+		g_splitUs[2] += (t1 - t0);
 		g_splitUs[3] += t5 - t4;
 	}
 #else
@@ -3164,9 +3252,53 @@ static bool ShadowTriangleCanCast(const GrVertex* vertex)
 	return true;
 }
 
-/* The vertices this flush draws from: g_vertexBuffer, or on Vita the reordered
- * copy Vita_ReorderSplits wrote (saves copying it back). */
-static GrVertex* s_drawVerts = g_vertexBuffer;
+
+/* The pass is opened on the first caster: a flush with none (HUD, menus) would
+ * otherwise still switch render targets twice and clear the map for nothing. */
+static bool s_shadowPassOpen = false;
+
+static void ShadowPassDraw(int startVertex, int numVerts)
+{
+	if (!s_shadowPassOpen)
+	{
+		GR_ShadowPassBegin();
+		s_shadowPassOpen = true;
+	}
+	GR_ShadowPassDraw(startVertex, numVerts);
+}
+
+#if defined(__vita__)
+/* Identifies what the shadow pass would draw; 0 = nothing. Standing still
+ * reproduces the same view-space vertices bit for bit, so an equal hash under an
+ * unchanged light means the map already holds this frame's shadows. */
+static unsigned ShadowCasterHash(void)
+{
+	unsigned h = 2166136261u, n = 0;
+
+	for (int i = 1; i <= g_splitIndex; i++)
+	{
+		const GPUDrawSplit& s = g_splits[i];
+		if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3 || s.blendMode != BM_NONE)
+			continue;
+		for (int offset = 0; offset + 2 < s.numVerts; offset += 3)
+		{
+			const GrVertex* v = &s_drawVerts[s.startVertex + offset];
+			if (!ShadowTriangleCanCast(v))
+				continue;
+			for (int k = 0; k < 3; k++)
+			{
+				unsigned w[3];
+				memcpy(w, &v[k].vsx, sizeof(w));
+				h = (h ^ w[0]) * 16777619u;
+				h = (h ^ w[1]) * 16777619u;
+				h = (h ^ w[2]) * 16777619u;
+			}
+			n++;
+		}
+	}
+	return n ? (h | 1u) : 0u;
+}
+#endif
 
 static void DrawShadowCasters(const GPUDrawSplit& split)
 {
@@ -3180,13 +3312,13 @@ static void DrawShadowCasters(const GPUDrawSplit& split)
 		}
 		else if (runStart >= 0)
 		{
-			GR_ShadowPassDraw(split.startVertex + runStart, offset - runStart);
+			ShadowPassDraw(split.startVertex + runStart, offset - runStart);
 			runStart = -1;
 		}
 	}
 
 	if (runStart >= 0)
-		GR_ShadowPassDraw(split.startVertex + runStart, split.numVerts - runStart);
+		ShadowPassDraw(split.startVertex + runStart, split.numVerts - runStart);
 }
 
 #if defined(__vita__)
@@ -3297,6 +3429,32 @@ static inline bool Vita_SplitsSameState(const GPUDrawSplit& a, const GPUDrawSpli
 		Vita_SplitKeysMatch(a, b);
 }
 
+/* Fingerprint of the fields Vita_SplitsSameState compares, so the window
+ * search rejects nearly every candidate with one integer compare. */
+static unsigned s_splitHash[MAX_DRAW_SPLITS];
+static unsigned s_groupHash[MAX_DRAW_SPLITS];
+
+static inline unsigned Vita_Mix(unsigned h, unsigned v)
+{
+	return (h ^ v) * 16777619u;
+}
+
+static unsigned Vita_SplitStateHash(const GPUDrawSplit& s)
+{
+	unsigned h = 2166136261u;
+	h = Vita_Mix(h, (unsigned)s.textureId);
+	h = Vita_Mix(h, (unsigned)s.texFormat | ((unsigned)s.blendMode << 8) | ((unsigned)s.depthMode << 16) |
+	                ((unsigned)s.drawPrimMode << 24));
+	h = Vita_Mix(h, (unsigned)s.palKey);
+	h = Vita_Mix(h, (unsigned)s.normalTextureId);
+	h = Vita_Mix(h, (unsigned)(unsigned short)s.drawenv.clip.x | ((unsigned)(unsigned short)s.drawenv.clip.y << 16));
+	h = Vita_Mix(h, (unsigned)(unsigned short)s.drawenv.clip.w | ((unsigned)(unsigned short)s.drawenv.clip.h << 16));
+	h = Vita_Mix(h, (unsigned)(unsigned short)s.drawenv.tw.x | ((unsigned)(unsigned short)s.drawenv.tw.y << 16));
+	h = Vita_Mix(h, (unsigned)(unsigned short)s.drawenv.tw.w | ((unsigned)(unsigned short)s.drawenv.tw.h << 16));
+	h = Vita_Mix(h, (unsigned)s.overrideHiresW | ((unsigned)s.overrideHiresH << 16));
+	return h;
+}
+
 static void Vita_ReorderSplits()
 {
 	int groupCount = 0, groupBase = 0, outSplits = 0, outVerts = 0;
@@ -3329,6 +3487,9 @@ static void Vita_ReorderSplits()
 			if (v[n].y > b.y1) b.y1 = v[n].y;
 		}
 		s_splitBox[i] = b;
+		if (s.palKey && g_vitaPalMinArea > 0 && (b.x1 - b.x0) * (b.y1 - b.y0) < g_vitaPalMinArea)
+			g_splits[i].palKey = 0;
+		s_splitHash[i] = Vita_SplitStateHash(g_splits[i]);
 	}
 
 	/* Emits groups [groupBase, groupCount) and resets the window. */
@@ -3373,7 +3534,7 @@ static void Vita_ReorderSplits()
 		int target = -1;
 		for (int g = groupCount - 1; g >= groupBase && g >= groupCount - VITA_REORDER_WINDOW; g--)
 		{
-			if (Vita_SplitsSameState(g_splits[s_groupRep[g]], s))
+			if (s_groupHash[g] == s_splitHash[i] && Vita_SplitsSameState(g_splits[s_groupRep[g]], s))
 			{
 				target = g;
 				break;
@@ -3397,6 +3558,7 @@ static void Vita_ReorderSplits()
 		else
 		{
 			s_groupRep[groupCount]   = i;
+			s_groupHash[groupCount]  = s_splitHash[i];
 			s_groupFirst[groupCount] = i;
 			s_groupLast[groupCount]  = i;
 			s_groupBox[groupCount]   = s_splitBox[i];
@@ -3417,9 +3579,10 @@ static void Vita_BatchSplits()
 {
 	int out = 0;
 
-	Vita_DropSmallPaletteSplits();
 	if (g_vitaReorder)
 		Vita_ReorderSplits();
+	else
+		Vita_DropSmallPaletteSplits();
 	for (int i = 1; i <= g_splitIndex; i++)
 	{
 		GPUDrawSplit s = g_splits[i];
@@ -3504,17 +3667,31 @@ void DrawAllSplits()
 	 * vertices into a false shadow. */
 	if (GR_FlashlightShadowActive())
 	{
-		GR_ShadowPassBegin();
-		for (int i = 1; i <= g_splitIndex; i++)
+		s_shadowPassOpen = false;
+#if defined(__vita__)
+		const unsigned casterHash = ShadowCasterHash();
+		if (casterHash == 0)
+			GR_ShadowMapKeep();
+		else if (!GR_ShadowMapCurrent(casterHash))
+#endif
 		{
-			const GPUDrawSplit& s = g_splits[i];
-			if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3)
-				continue;
-			if (s.blendMode != BM_NONE)
-				continue;
-			DrawShadowCasters(s);
+			for (int i = 1; i <= g_splitIndex; i++)
+			{
+				const GPUDrawSplit& s = g_splits[i];
+				if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3)
+					continue;
+				if (s.blendMode != BM_NONE)
+					continue;
+				DrawShadowCasters(s);
+			}
+			if (s_shadowPassOpen)
+			{
+				GR_ShadowPassEnd();
+#if defined(__vita__)
+				GR_ShadowMapWritten(casterHash);
+#endif
+			}
 		}
-		GR_ShadowPassEnd();
 	}
 
 	if (g_PsxUsePgxp && g_splitIndex > s_dbgSplitHighWater)
@@ -3523,6 +3700,9 @@ void DrawAllSplits()
 	const unsigned long long sb3 = SPLIT_T();
 #endif
 
+#if defined(__vita__)
+	s_beamOn = GR_VitaBeamBegin();
+#endif
 	for (int i = 1; i <= g_splitIndex; i++)
 	{
 		if (g_splits[i].kind == GPU_SPLIT_MODERN)
