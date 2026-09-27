@@ -3050,7 +3050,7 @@ extern "C" { unsigned long long g_splitUs[4]; unsigned long long g_submitUs[4]; 
 static GrVertex* s_drawVerts = g_vertexBuffer;
 
 #if defined(__vita__)
-#define VITA_BEAM_MIN_RUN  8
+#define VITA_BEAM_MIN_RUN  12
 #define VITA_BEAM_MAX_TRIS 16384
 static int s_beamOn = 0;
 static unsigned char s_beamClass[VITA_BEAM_MAX_TRIS];

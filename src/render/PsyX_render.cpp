@@ -2693,8 +2693,14 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
  * was tried and gave no measurable speedup, only hard pixel-stepped edges. */
 #if defined(PSYX_VITA)
 #	define GPU_SHADOW_BEAM_GATE "cone * atten > 0.0"
+/* Shadow distance: no lookup where the beam is dim (far down a corridor the
+ * whole screen was otherwise in range), faded in over the next band. */
+#	define GPU_SHADOW_RANGE_GATE " && d < 0.65 * u_flRange"
+#	define GPU_SHADOW_RANGE_FADE "							shadow = mix(shadow, 1.0, smoothstep(0.5 * u_flRange, 0.65 * u_flRange, d));\n"
 #else
 #	define GPU_SHADOW_BEAM_GATE "true"
+#	define GPU_SHADOW_RANGE_GATE ""
+#	define GPU_SHADOW_RANGE_FADE ""
 #endif
 #define GPU_SHADOW_PCF_LO    "-1"
 #define GPU_SHADOW_PCF_HI    "2"
@@ -2768,7 +2774,8 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"							vec4 sd = vec4(shFetch(vec2(sb.x, v)), shFetch(vec2(sb.x + ox.y, v)), shFetch(vec2(sb.x + ox.z, v)), shFetch(vec2(sb.x + ox.w, v)));\n"\
 	"							occ += wy.w * dot(wx, step(sd, rzx + dzdv * (v - luv.y))); }\n"\
 	"							}\n"\
-	"							shadow = 1.0 - u_shadowStrength * (occ / 9.0);\n"
+	"							shadow = 1.0 - u_shadowStrength * (occ / 9.0);\n"\
+	GPU_SHADOW_RANGE_FADE
 #else
 #	define GPU_SHADOW_FILTER\
 	"							float recvLin = (u_shadowFadeDist > 0.0) ? shLinDepth(luv.z) : 0.0;\n"\
@@ -2851,7 +2858,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	/* Bilinearly interpolated 3x3 PCF avoids kernel jumps as the projected receiver crosses shadow texels. */\
 	"				float shadow = 1.0;\n"\
 	"#ifndef PSYX_NO_SHADOW\n"\
-	"				if (u_shadowOn > 0 && " GPU_SHADOW_BEAM_GATE ") {\n"\
+	"				if (u_shadowOn > 0 && " GPU_SHADOW_BEAM_GATE GPU_SHADOW_RANGE_GATE ") {\n"\
 	/* Perspective-correct shadow receiver (PR#8): correctness for BOTH styles -- same shadow shapes, just stable under motion. */\
 	"					vec3 flShadowP = v_shadowViewPos.xyz / max(v_shadowViewPos.w, 1e-9);\n"\
 	"					vec3 flPs = flShadowP + L * (u_shadowNormalOffset * d);\n"\
