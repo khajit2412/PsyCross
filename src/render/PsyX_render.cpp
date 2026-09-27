@@ -352,6 +352,21 @@ void GR_ApplyRenderScale(void)
 	}
 }
 
+#if defined(PSYX_VITA)
+/* Dynamic resolution (vita_glcmd.c) changed the display mode: same handling as
+ * a desktop window resize, applied between frames. */
+extern "C" void Pc_VitaResolutionChanged(int w, int h);
+void GR_ResetDevice();
+extern "C" void Vita_ApplySurfaceSize(int w, int h)
+{
+	g_surfaceWidth  = w;
+	g_surfaceHeight = h;
+	GR_ApplyRenderScale();
+	GR_ResetDevice();
+	Pc_VitaResolutionChanged(w, h);
+}
+#endif
+
 int g_dbg_wireframeMode = 0;
 int g_dbg_texturelessMode = 0;
 
@@ -2140,6 +2155,26 @@ static int s_compileOpaque = 0;
 struct LitShaderSet { GTEShader s4, s8, s16, s32, s32o; int built; };
 static LitShaderSet s_litSets[4];
 static int s_compileLitVariant = -1;
+static int s_litNoHalf = 0;
+static int s_shaderCompileFailed = 0;
+
+/* Shadow map as the pass's real depth buffer (vglTexImageDepthBuffer, DF32M)
+ * instead of depth packed into RGBA8: one float read per PCF tap. Config key
+ * vita_shadow_depth_texture (default 1); 0 = the packed colour target. */
+static GLuint s_shadowZTex = 0;
+static int    s_shadowZAliased = 0;
+static int    s_shadowZStored = 0;	/* a pass has run since: the alias turned depth stores on */
+extern "C" const char* Pc_ModConfig_Value(const char* key);
+static int GR_VitaShadowZMode(void)
+{
+	static int mode = -1;
+	if (mode < 0)
+	{
+		const char* v = Pc_ModConfig_Value("vita_shadow_depth_texture");
+		mode = (v && v[0] == '0') ? 0 : 1;
+	}
+	return mode;
+}
 #endif
 
 #if USE_OPENGL
@@ -2632,7 +2667,11 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
  * RGBA8 by s_shadowDepthShaderSrc, unpacked here. */
 #if defined(PSYX_VITA)
 #	define GPU_SHADOW_FETCH_FUNC\
-	"	float shFetch(vec2 uv) { return dot(texture2D(u_shadowTex, uv), vec4(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 16581375.0)); }\n"
+	"#ifdef PSYX_SHADOW_ZTEX\n"\
+	"	float shFetch(vec2 uv) { return texture2D(u_shadowTex, uv).r; }\n"\
+	"#else\n"\
+	"	float shFetch(vec2 uv) { return dot(texture2D(u_shadowTex, uv), vec4(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 16581375.0)); }\n"\
+	"#endif\n"
 #else
 #	define GPU_SHADOW_FETCH_FUNC\
 	"	float shFetch(vec2 uv) { return texture2D(u_shadowTex, uv).r; }\n"
@@ -2653,6 +2692,20 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
  * renders lit world geometry - including the 32-bit RGBA override shader,
  * whose textures (virtual pool slots, hi-res/pack replacements) cover the
  * same world surfaces as the VRAM samplers. */
+/* Low-range lighting terms (weights, N.L, shadow factor, beam colour) as Cg
+ * half on the Vita lit programs: the GPU runs half maths at twice the rate.
+ * Positions and depths stay float. Defaults to float everywhere else. */
+#define GPU_HALF_TYPES\
+	"#ifdef PSYX_LIT_HALF\n"\
+	"#define hf half\n"\
+	"#define hf3 half3\n"\
+	"#define hf4 half4\n"\
+	"#else\n"\
+	"#define hf float\n"\
+	"#define hf3 vec3\n"\
+	"#define hf4 vec4\n"\
+	"#endif\n"
+
 #define GPU_LIT_UNIFORMS\
 	"	uniform vec3 u_fogColor;\n"\
 	"	uniform int u_fogToBlack;\n"\
@@ -2678,6 +2731,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"	uniform vec2 u_shadowClip;\n"\
 	"	uniform float u_shadowFadeDist;\n"\
 	GPU_SHADOW_FETCH_FUNC\
+	GPU_HALF_TYPES\
 	/* Window depth [0,1] -> linear distance along the light's forward axis, using the shadow frustum's near/far (u_shadowClip). Lets us measure how far a receiver sits BEHIND its occluder in world units. */\
 	"	float shLinDepth(float zw) {\n"\
 	"		float ndc = zw * 2.0 - 1.0;\n"\
@@ -2696,7 +2750,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 /* Shadow distance: no lookup where the beam is dim (far down a corridor the
  * whole screen was otherwise in range), faded in over the next band. */
 #	define GPU_SHADOW_RANGE_GATE " && d < 0.65 * u_flRange"
-#	define GPU_SHADOW_RANGE_FADE "							shadow = mix(shadow, 1.0, smoothstep(0.5 * u_flRange, 0.65 * u_flRange, d));\n"
+#	define GPU_SHADOW_RANGE_FADE "							shadow = mix(float(shadow), 1.0, smoothstep(0.5 * u_flRange, 0.65 * u_flRange, d));\n"
 #else
 #	define GPU_SHADOW_BEAM_GATE "true"
 #	define GPU_SHADOW_RANGE_GATE ""
@@ -2749,12 +2803,15 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"							vec2 texelPos = luv.xy / u_shadowTexel - vec2(0.5);\n"\
 	"							vec2 texelBase = floor(texelPos);\n"\
 	"							vec2 f = texelPos - texelBase;\n"\
-	"							vec4 wx = vec4(1.0 - f.x, 1.0, 1.0, f.x);\n"\
-	"							vec4 wy = vec4(1.0 - f.y, 1.0, 1.0, f.y);\n"\
+	"							hf4 wx = hf4(1.0 - f.x, 1.0, 1.0, f.x);\n"\
+	"							hf4 wy = hf4(1.0 - f.y, 1.0, 1.0, f.y);\n"\
 	"							vec2 sb = (texelBase - vec2(0.5)) * u_shadowTexel;\n"\
 	"							vec4 ox = vec4(0.0, 1.0, 2.0, 3.0) * u_shadowTexel.x;\n"\
 	"							vec4 rzx = vec4(luv.z - u_shadowBias) + dzdu * (vec4(sb.x) + ox - vec4(luv.x));\n"\
-	"							float occ = 0.0;\n"\
+	"#ifdef PSYX_SHADOW_ZTEX\n"\
+	"							rzx -= vec4(1.5 * (abs(dzdu) + abs(dzdv)) * u_shadowTexel.x);\n"\
+	"#endif\n"\
+	"							hf occ = 0.0;\n"\
 	"							float sb3 = sb.y + 3.0 * u_shadowTexel.y;\n"\
 	"							vec4 cz = vec4(shFetch(sb), shFetch(vec2(sb.x + ox.w, sb.y)), shFetch(vec2(sb.x, sb3)), shFetch(vec2(sb.x + ox.w, sb3)));\n"\
 	"							vec4 cr = rzx.xwxw + dzdv * (vec4(sb.y, sb.y, sb3, sb3) - vec4(luv.y));\n"\
@@ -2763,16 +2820,16 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"							else if (cs > 0.5) {\n"\
 	"							{ float v = sb.y + 0.0 * u_shadowTexel.y;\n"\
 	"							vec4 sd = vec4(shFetch(vec2(sb.x, v)), shFetch(vec2(sb.x + ox.y, v)), shFetch(vec2(sb.x + ox.z, v)), shFetch(vec2(sb.x + ox.w, v)));\n"\
-	"							occ += wy.x * dot(wx, step(sd, rzx + dzdv * (v - luv.y))); }\n"\
+	"							occ += wy.x * dot(vec4(wx), step(sd, rzx + dzdv * (v - luv.y))); }\n"\
 	"							{ float v = sb.y + 1.0 * u_shadowTexel.y;\n"\
 	"							vec4 sd = vec4(shFetch(vec2(sb.x, v)), shFetch(vec2(sb.x + ox.y, v)), shFetch(vec2(sb.x + ox.z, v)), shFetch(vec2(sb.x + ox.w, v)));\n"\
-	"							occ += wy.y * dot(wx, step(sd, rzx + dzdv * (v - luv.y))); }\n"\
+	"							occ += wy.y * dot(vec4(wx), step(sd, rzx + dzdv * (v - luv.y))); }\n"\
 	"							{ float v = sb.y + 2.0 * u_shadowTexel.y;\n"\
 	"							vec4 sd = vec4(shFetch(vec2(sb.x, v)), shFetch(vec2(sb.x + ox.y, v)), shFetch(vec2(sb.x + ox.z, v)), shFetch(vec2(sb.x + ox.w, v)));\n"\
-	"							occ += wy.z * dot(wx, step(sd, rzx + dzdv * (v - luv.y))); }\n"\
+	"							occ += wy.z * dot(vec4(wx), step(sd, rzx + dzdv * (v - luv.y))); }\n"\
 	"							{ float v = sb.y + 3.0 * u_shadowTexel.y;\n"\
 	"							vec4 sd = vec4(shFetch(vec2(sb.x, v)), shFetch(vec2(sb.x + ox.y, v)), shFetch(vec2(sb.x + ox.z, v)), shFetch(vec2(sb.x + ox.w, v)));\n"\
-	"							occ += wy.w * dot(wx, step(sd, rzx + dzdv * (v - luv.y))); }\n"\
+	"							occ += wy.w * dot(vec4(wx), step(sd, rzx + dzdv * (v - luv.y))); }\n"\
 	"							}\n"\
 	"							shadow = 1.0 - u_shadowStrength * (occ / 9.0);\n"\
 	GPU_SHADOW_RANGE_FADE
@@ -2835,7 +2892,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"				float d = length(L);\n"\
 	"				L /= max(d, 0.0001);\n"\
 	"				float cone  = smoothstep(u_flOuterCos, u_flInnerCos, dot(-L, flDir));\n"\
-	"				float ndl = 1.0;\n"\
+	"				hf ndl = 1.0;\n"\
 	"				float atten;\n"\
 	"				if (FL_CLASSIC) {\n"\
 	"					cone = cone * (2.0 - cone);\n"\
@@ -2856,7 +2913,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"					}\n"\
 	"				}\n"\
 	/* Bilinearly interpolated 3x3 PCF avoids kernel jumps as the projected receiver crosses shadow texels. */\
-	"				float shadow = 1.0;\n"\
+	"				hf shadow = 1.0;\n"\
 	"#ifndef PSYX_NO_SHADOW\n"\
 	"				if (u_shadowOn > 0 && " GPU_SHADOW_BEAM_GATE GPU_SHADOW_RANGE_GATE ") {\n"\
 	/* Perspective-correct shadow receiver (PR#8): correctness for BOTH styles -- same shadow shapes, just stable under motion. */\
@@ -2880,7 +2937,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"					}\n"\
 	"				}\n"\
 	"#endif\n"\
-	"				vec3 fl = u_flColor * (cone * atten * ndl * shadow);\n"\
+	"				hf3 fl = u_flColor * (cone * atten * ndl * shadow);\n"\
 	"				fragColor.rgb += flAlbedo * fl * (1.0 - clamp(v_fade, 0.0, 1.0));\n"\
 	"			}\n"\
 	"		}\n"\
@@ -3355,6 +3412,10 @@ ShaderID GR_Shader_Compile(const char* source)
 		strcat(extra_fs_defines, (s_compileLitVariant & 2) ? "#define FL_CLASSIC true\n" : "#define FL_CLASSIC false\n");
 		if (!(s_compileLitVariant & 1))
 			strcat(extra_fs_defines, "#define PSYX_NO_SHADOW\n");
+		else if (GR_VitaShadowZMode())
+			strcat(extra_fs_defines, "#define PSYX_SHADOW_ZTEX\n");
+		if (!s_litNoHalf)
+			strcat(extra_fs_defines, "#define PSYX_LIT_HALF\n");
 	}
 #endif
 #endif
@@ -3381,7 +3442,12 @@ ShaderID GR_Shader_Compile(const char* source)
 		glCompileShader(vertexShader);
 
 		if( GR_Shader_CheckShaderStatus(vertexShader) == 0 )
+		{
 			eprinterr("Failed to compile Vertex Shader!\n");
+#if defined(PSYX_VITA)
+			s_shaderCompileFailed = 1;
+#endif
+		}
 	
 		glAttachShader(program, vertexShader);
 		glDeleteShader(vertexShader);
@@ -3393,7 +3459,12 @@ ShaderID GR_Shader_Compile(const char* source)
 		glCompileShader(fragmentShader);
 
 		if(GR_Shader_CheckShaderStatus(fragmentShader) == 0)
+		{
 			eprinterr("Failed to compile Fragment Shader!\n");
+#if defined(PSYX_VITA)
+			s_shaderCompileFailed = 1;
+#endif
+		}
 	
 		glAttachShader(program, fragmentShader);
 		glDeleteShader(fragmentShader);
@@ -3412,7 +3483,12 @@ ShaderID GR_Shader_Compile(const char* source)
 
 	glLinkProgram(program);
 	if(GR_Shader_CheckProgramStatus(program) == 0)
+	{
 		eprinterr("Failed to link Shader!\n");
+#if defined(PSYX_VITA)
+		s_shaderCompileFailed = 1;
+#endif
+	}
 
 	GLint sampler = 0;
 	GLint lutSampler = 2;
@@ -3605,8 +3681,9 @@ static LitShaderSet* GR_VitaLitSet(void)
 	const int idx = (g_PsyX_FlashlightStyle ? 2 : 0) | (g_PsyX_UseFlashlightShadows ? 1 : 0);
 	LitShaderSet* set = &s_litSets[idx];
 
-	if (!set->built)
+	while (!set->built)
 	{
+		s_shaderCompileFailed = 0;
 		s_compileLitVariant = idx;
 		GR_CompilePSXShader(&set->s4, gte_shader_4);
 		GR_CompilePSXShader(&set->s8, gte_shader_8);
@@ -3616,9 +3693,16 @@ static LitShaderSet* GR_VitaLitSet(void)
 		GR_CompilePSXShader(&set->s32o, gte_shader_32_rgba);
 		s_compileOpaque = 0;
 		s_compileLitVariant = -1;
+		if (s_shaderCompileFailed && !s_litNoHalf)
+		{
+			/* The shader compiler refused the half types: full precision. */
+			s_litNoHalf = 1;
+			eprintf("[LITSHADER] half precision rejected, rebuilding with float\n");
+			continue;
+		}
 		set->built = 1;
 		g_PreviousShader = (ShaderID)-1;
-		eprintf("[LITSHADER] built style=%s shadows=%d\n", (idx & 2) ? "classic" : "modern", idx & 1);
+		eprintf("[LITSHADER] built style=%s shadows=%d half=%d\n", (idx & 2) ? "classic" : "modern", idx & 1, !s_litNoHalf);
 	}
 	return set;
 }
@@ -4306,6 +4390,10 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		int shadowOn = (g_PsyX_UseFlashlightShadows && g_PsyX_UsePerPixelFlashlight &&
 		                g_PsyX_FlashlightActive && g_shadowDepthTex != 0 &&
 		                !g_PsxPresentLastFrame) ? 1 : 0;
+#if defined(PSYX_VITA)
+		if (GR_VitaShadowZMode() && !s_shadowZStored)
+			shadowOn = 0;
+#endif
 		/* shadowOn is a BINARY whole-scene lighting term: when it drops, every
 		 * shadowed surface becomes lit and the frame pops brighter. A single
 		 * frame of that reads exactly like the dim-gate flicker already fixed on
@@ -4346,7 +4434,11 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 			if (u_shadowTexelLoc != -1)
 				glUniform2f(u_shadowTexelLoc, 1.0f / (float)PSYX_SHADOW_MAP_SIZE, 1.0f / (float)PSYX_SHADOW_MAP_SIZE);
 			glActiveTexture(GL_TEXTURE1);
+#if defined(PSYX_VITA)
+			glBindTexture(GL_TEXTURE_2D, GR_VitaShadowZMode() ? s_shadowZTex : g_shadowDepthTex);
+#else
 			glBindTexture(GL_TEXTURE_2D, g_shadowDepthTex);
+#endif
 			glActiveTexture(GL_TEXTURE0);
 		}
 	}
@@ -6487,8 +6579,37 @@ void GR_ShadowPassDraw(int startVertex, int numVerts)
 	glDrawArrays(GL_TRIANGLES, startVertex, numVerts);
 }
 
+#if defined(PSYX_VITA)
+static void GR_VitaAliasShadowDepth(void*)
+{
+	vglTexImageDepthBuffer(GL_TEXTURE_2D);
+}
+#endif
+
 void GR_ShadowPassEnd(void)
 {
+#if defined(PSYX_VITA)
+	/* vitaGL creates an FBO's depth buffer at its first scene, so the alias can
+	 * only be made once a pass has run. It needs the pass FBO as the read
+	 * framebuffer (still bound here) and the texture on the active unit. */
+	if (s_shadowZAliased)
+		s_shadowZStored = 1;
+	if (GR_VitaShadowZMode() && !s_shadowZAliased)
+	{
+		if (s_shadowZTex == 0)
+			glGenTextures(1, &s_shadowZTex);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, s_shadowZTex);
+		VGLR_Call(GR_VitaAliasShadowDepth, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		s_shadowZAliased = 1;
+		s_mapValid = 0;
+		eprintf("[SHADOWZ] shadow map sampled from the pass depth buffer\n");
+	}
+#endif
 	glDisable(GL_POLYGON_OFFSET_FILL);
 	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)s_shadowPrevFBO);
 	glViewport(s_shadowPrevViewport[0], s_shadowPrevViewport[1],

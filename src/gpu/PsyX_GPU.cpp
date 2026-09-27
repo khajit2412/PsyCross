@@ -210,7 +210,13 @@ static const VsEntry* Vs_Get(const void* addr, unsigned value) {
 /* GTE store hook for the flashlight view-space FIFO (PsyX_GTE.cpp PGXP_StoreAddr,
  * fired when g_PsyX_UsePerPixelFlashlight). The packed vertex word is already at
  * addr when the hook fires (same contract as PGXP's Shadow_Store). */
+#if defined(__vita__)
+extern "C" { unsigned g_vitaProfCnt[8]; unsigned long long g_vitaProfUs[4]; unsigned long long g_vitaProfUnlit[4]; }
+#endif
 extern "C" void VShadow_Store(void* addr, float vx, float vy, float vz, float ofx, float ofy, float h) {
+#if defined(__vita__)
+	g_vitaProfCnt[1]++;
+#endif
 	Vs_Put(addr, vx, vy, vz, g_PsyX_NoShadowCast ? 1.0f : 0.0f, *(const unsigned*)addr, ofx, ofy, h,
 	       g_PsyX_CharaFade);
 }
@@ -222,6 +228,9 @@ extern "C" void VShadow_Store(void* addr, float vx, float vy, float vz, float of
  * shadows are independently gated, so each is byte-identical when its flag is
  * off and both off => an immediate return (legacy path). */
 extern "C" void Shadow_Copy(void* dst, const void* src) {
+#if defined(__vita__)
+	g_vitaProfCnt[2]++;
+#endif
 	if (g_PsxUsePgxp) {
 		const ShadowEntry* e = Shadow_Get(src);
 		if (e) Shadow_Put(dst, e->x, e->y, e->w, *(const unsigned*)dst);

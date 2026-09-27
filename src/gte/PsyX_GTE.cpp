@@ -68,6 +68,9 @@ unsigned int gte_leadingzerocount(unsigned int lzcs)
 
 	if (!lzcs)
 		return 32;
+#if defined(__vita__)
+	return (unsigned int)__builtin_clz(lzcs);
+#endif
 
 	// perform fast bit scan
 
@@ -319,9 +322,23 @@ extern "C" int g_PsxWholeMapLastSz; /* true (unclamped) SZ of the newest RTPS, w
  * SXY2=2) to `addr`, so record the shadow keyed by that address, validated by
  * the integer value the macro left there (DuckStation's SWC2 hook). */
 extern "C" void Shadow_Store(void* addr, float x, float y, float w, unsigned value);
+#if defined(__vita__)
+extern "C" unsigned g_vitaProfCnt[8];
+#endif
 extern "C" void PGXP_StoreAddr(void* addr, int slot)
 {
 	if ((unsigned)slot > 2u) return;
+	/* SH1 computes its dynamic (flashlight) vertex lighting by pushing each
+	 * vertex's light vector through RTPS under SetGeomOffset(-1024,-1024) /
+	 * SetGeomScreen(16) (bodyprog_80055028.c func_80057658 and siblings), then
+	 * reads the "screen" result as a light term. Those stores land in scratch
+	 * and are never drawn, but each one went through both shadow tables: on
+	 * Vita most of the world-draw time. No geometry projects with H=16. */
+	if (C2_H == 16 && C2_OFX == -(1024 << 16) && C2_OFY == -(1024 << 16))
+		return;
+#if defined(__vita__)
+	g_vitaProfCnt[3]++;
+#endif
 	/* The gte_stsxy* macros now call this when (g_PsxUsePgxp ||
 	 * g_PsyX_UsePerPixelFlashlight), so each store is independently gated:
 	 * PGXP unchanged when its flag is off, flashlight a no-op when its flag is
@@ -727,6 +744,84 @@ int GTE_RotTransPers(int idx, int lm)
 	double wmFarX = 0.0, wmFarY = 0.0;
 	float  wmFarW = 0.0f;
 
+#if defined(__vita__)
+	/* Same arithmetic, flags and saturation as the generic path below, kept in
+	 * locals: every helper there read-modify-wrote C2_FLAG and the registers in
+	 * memory, and -fno-strict-aliasing makes the compiler reload all of it after
+	 * each store. That was ~1000 cycles per projected vertex on Vita. */
+	{
+		const long long vx = VX(idx), vy = VY(idx), vz = VZ(idx);
+		unsigned int flag = (unsigned int)C2_FLAG;
+		const long long m1 = ((long long)C2_TRX << 12) + (int)(C2_R11 * vx) + (int)(C2_R12 * vy) + (int)(C2_R13 * vz);
+		const long long m2 = ((long long)C2_TRY << 12) + (int)(C2_R21 * vx) + (int)(C2_R22 * vy) + (int)(C2_R23 * vz);
+		const long long m3 = ((long long)C2_TRZ << 12) + (int)(C2_R31 * vx) + (int)(C2_R32 * vy) + (int)(C2_R33 * vz);
+
+		if (m1 > 0x7ffffffffffLL) flag |= (1u << 31) | (1u << 30);
+		if (m1 < -0x8000000000LL) flag |= (1u << 31) | (1u << 27);
+		if (m2 > 0x7ffffffffffLL) flag |= (1u << 31) | (1u << 29);
+		if (m2 < -0x8000000000LL) flag |= (1u << 31) | (1u << 26);
+		if (m3 > 0x7ffffffffffLL) flag |= (1u << 31) | (1u << 28);
+		if (m3 < -0x8000000000LL) flag |= (1u << 31) | (1u << 25);
+
+		const int mac1 = (int)gte_shift(m1, m_sf);
+		const int mac2 = (int)gte_shift(m2, m_sf);
+		const int mac3 = (int)gte_shift(m3, m_sf);
+		m_mac3 = m3;
+
+		const int irMin = lm ? 0 : -0x8000;
+		int ir1 = mac1, ir2 = mac2, ir3;
+		if (ir1 > 0x7fff) { ir1 = 0x7fff; flag |= (1u << 31) | (1u << 24); }
+		else if (ir1 < irMin) { ir1 = irMin; flag |= (1u << 31) | (1u << 24); }
+		if (ir2 > 0x7fff) { ir2 = 0x7fff; flag |= (1u << 31) | (1u << 23); }
+		else if (ir2 < irMin) { ir2 = irMin; flag |= (1u << 31) | (1u << 23); }
+		{
+			/* Lm_B3_sf: the flag tests the >>12 value whatever sf is. */
+			const int v12 = (int)(m3 >> 12);
+			if (v12 < -0x8000 || v12 > 0x7fff) flag |= (1u << 22);
+			ir3 = mac3;
+			if (ir3 > 0x7fff) ir3 = 0x7fff;
+			else if (ir3 < irMin) ir3 = irMin;
+		}
+
+		int sz3 = (int)(m3 >> 12);
+		if (sz3 > 0xffff) { sz3 = 0xffff; flag |= (1u << 31) | (1u << 18); }
+		else if (sz3 < 0) { sz3 = 0; flag |= (1u << 31) | (1u << 18); }
+
+		unsigned int hs = gte_divide((unsigned short)C2_H, (unsigned short)sz3);
+		if (hs == 0xffffffff) { hs = 0x1ffff; flag |= (1u << 31) | (1u << 17); }
+		else if (hs > 0x1ffff) hs = 0x1ffff;
+		h_over_sz3 = (int)hs;
+
+		const long long fx = (long long)C2_OFX + (long long)ir1 * h_over_sz3;
+		const long long fy = (long long)C2_OFY + (long long)ir2 * h_over_sz3;
+		if (fx > 0x7fffffffLL) flag |= (1u << 31) | (1u << 16);
+		if (fx < -0x80000000LL) flag |= (1u << 31) | (1u << 15);
+		if (fy > 0x7fffffffLL) flag |= (1u << 31) | (1u << 16);
+		if (fy < -0x80000000LL) flag |= (1u << 31) | (1u << 15);
+		m_mac0 = fy;
+		long long sx = fx >> 16, sy = fy >> 16;
+		if (sx > 0x3ff) { sx = 0x3ff; flag |= (1u << 31) | (1u << 14); }
+		else if (sx < -0x400) { sx = -0x400; flag |= (1u << 31) | (1u << 14); }
+		if (sy > 0x3ff) { sy = 0x3ff; flag |= (1u << 31) | (1u << 13); }
+		else if (sy < -0x400) { sy = -0x400; flag |= (1u << 31) | (1u << 13); }
+
+		C2_MAC1 = mac1;
+		C2_MAC2 = mac2;
+		C2_MAC3 = mac3;
+		C2_IR1 = ir1;
+		C2_IR2 = ir2;
+		C2_IR3 = ir3;
+		C2_SZ0 = C2_SZ1;
+		C2_SZ1 = C2_SZ2;
+		C2_SZ2 = C2_SZ3;
+		C2_SZ3 = sz3;
+		C2_SXY0 = C2_SXY1;
+		C2_SXY1 = C2_SXY2;
+		C2_SX2 = (int)sx;
+		C2_SY2 = (int)sy;
+		C2_FLAG = flag;
+	}
+#else
 	C2_MAC1 = A1(/*int44*/(long long)((long long)C2_TRX << 12) + (C2_R11 * VX(idx)) + (C2_R12 * VY(idx)) + (C2_R13 * VZ(idx)));
 	C2_MAC2 = A2(/*int44*/(long long)((long long)C2_TRY << 12) + (C2_R21 * VX(idx)) + (C2_R22 * VY(idx)) + (C2_R23 * VZ(idx)));
 	C2_MAC3 = A3(/*int44*/(long long)((long long)C2_TRZ << 12) + (C2_R31 * VX(idx)) + (C2_R32 * VY(idx)) + (C2_R33 * VZ(idx)));
@@ -742,6 +837,7 @@ int GTE_RotTransPers(int idx, int lm)
 	C2_SXY1 = C2_SXY2;
 	C2_SX2 = Lm_G1(F((long long)C2_OFX + ((long long)C2_IR1 * h_over_sz3)) >> 16);
 	C2_SY2 = Lm_G2(F((long long)C2_OFY + ((long long)C2_IR2 * h_over_sz3)) >> 16);
+#endif
 
 	/* Whole-map far re-projection. The standard path above divides IR1/IR2 (view
 	 * X/Y clamped to s16) by SZ3 (view depth clamped to 0xffff), so beyond the
@@ -752,6 +848,15 @@ int GTE_RotTransPers(int idx, int lm)
 	 * (still range-limited by Lm_G to the ±0x400 screen box; off-screen far
 	 * geometry clamps to the edge exactly as a near off-screen vertex would).
 	 * Gated on g_PsxWholeMapFar so the legacy path is byte-identical when off. */
+#if defined(__vita__)
+	/* SH1's per-vertex lighting runs its light vectors through RTPS under
+	 * SetGeomOffset(-1024,-1024)/SetGeomScreen(16) and reads the "screen"
+	 * result as a light term (bodyprog_80055028.c func_80057658 and siblings).
+	 * Nothing of it is ever drawn, so the PGXP, view-space and whole-map
+	 * bookkeeping below is skipped: ~5000 of these per frame in a corridor. */
+	if (C2_H == 16 && C2_OFX == -(1024 << 16) && C2_OFY == -(1024 << 16))
+		return h_over_sz3;
+#endif
 	if (g_PsxWholeMapFar)
 	{
 		long long fz = gte_shift(m_mac3, 1); /* unclamped SZ3 */
@@ -852,8 +957,8 @@ int GTE_RotTransPers(int idx, int lm)
 		 * These globals are only the fallback for an untracked poly — the values
 		 * that actually get used ride the per-vertex VsEntry shadow, because the
 		 * clipper runs at DrawOTag time and SH1 reprograms OFX/OFY/H mid-frame. */
-		g_PgxpGteOfx = (float)((double)C2_OFX / 65536.0);
-		g_PgxpGteOfy = (float)((double)C2_OFY / 65536.0);
+		g_PgxpGteOfx = ((float)C2_OFX * (1.0f / 65536.0f));
+		g_PgxpGteOfy = ((float)C2_OFY * (1.0f / 65536.0f));
 		g_PgxpGteH   = (float)C2_H;
 	}
 
@@ -868,9 +973,9 @@ int GTE_RotTransPers(int idx, int lm)
 		s_vsFifoZ[0] = s_vsFifoZ[1]; s_vsFifoZ[1] = s_vsFifoZ[2]; s_vsFifoZ[2] = (float)C2_MAC3;
 
 		s_vsFifoOfx[0] = s_vsFifoOfx[1]; s_vsFifoOfx[1] = s_vsFifoOfx[2];
-		s_vsFifoOfx[2] = (float)((double)C2_OFX / 65536.0);
+		s_vsFifoOfx[2] = ((float)C2_OFX * (1.0f / 65536.0f));
 		s_vsFifoOfy[0] = s_vsFifoOfy[1]; s_vsFifoOfy[1] = s_vsFifoOfy[2];
-		s_vsFifoOfy[2] = (float)((double)C2_OFY / 65536.0);
+		s_vsFifoOfy[2] = ((float)C2_OFY * (1.0f / 65536.0f));
 		s_vsFifoH[0] = s_vsFifoH[1]; s_vsFifoH[1] = s_vsFifoH[2];
 		s_vsFifoH[2] = (float)C2_H;
 	}
@@ -880,6 +985,9 @@ int GTE_RotTransPers(int idx, int lm)
 
 int GTE_operator(int op)
 {
+#if defined(__vita__)
+	g_vitaProfCnt[0]++;
+#endif
 	int v;
 	int lm;
 	int cv;
@@ -891,6 +999,14 @@ int GTE_operator(int op)
 
 	C2_FLAG = 0;
 
+	#if defined(__vita__)
+	{
+		const int fn = GTE_FUNCT(gteop(op));
+		if (fn == 0x01) g_vitaProfCnt[4]++;
+		else if (fn == 0x30) g_vitaProfCnt[5]++;
+		else g_vitaProfCnt[6]++;
+	}
+#endif
 	switch (GTE_FUNCT(gteop(op)))
 	{
 	case 0x00:

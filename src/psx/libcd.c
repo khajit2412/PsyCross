@@ -35,10 +35,62 @@ typedef struct _VFILE
 	size_t		size;
 } VFILE;
 
+#if defined(__vita__)
+/* Sector cache for the disc image. Every sector was an fread (a sceIoRead on
+ * the memory card), and walking between a room and its hallway re-read the same
+ * files each time. Direct-mapped on sector index so a contiguous file lands in
+ * consecutive slots. Data reads only; XA streams would just evict. */
+#define CDC_SLOTS 6144	/* 14 MB of 2352-byte sectors */
+extern int g_cdSectorSize;
+static u_char* s_cdcData;
+static int*    s_cdcTag;
+static int     s_cdcOff;
+static long    s_vPos = -1;	/* logical position, -1 = unknown */
+static long    s_fPos = -1;	/* position of the FILE itself */
+int g_cdcStats[2];
+
+static int CdCacheReady(void)
+{
+	if (s_cdcOff)
+		return 0;
+	if (!s_cdcData)
+	{
+		s_cdcData = (u_char*)malloc((size_t)CDC_SLOTS * CD_SECTOR_SIZE_MODE2);
+		s_cdcTag  = (int*)malloc(CDC_SLOTS * sizeof(int));
+		if (!s_cdcData || !s_cdcTag)
+		{
+			free(s_cdcData); free(s_cdcTag);
+			s_cdcData = NULL; s_cdcTag = NULL; s_cdcOff = 1;
+			return 0;
+		}
+		memset(s_cdcTag, 0xff, CDC_SLOTS * sizeof(int));
+	}
+	return 1;
+}
+
+static size_t CdFileRead(void* buf, size_t n, FILE* fp)
+{
+	if (s_fPos != s_vPos)
+		fseek(fp, s_vPos, SEEK_SET);
+	size_t got = fread(buf, 1, n, fp);
+	s_vPos += (long)got;
+	s_fPos = s_vPos;
+	return got;
+}
+
+static size_t CdCachedRead(void* buf, size_t es, size_t ec, FILE* fp);
+#endif
+
 size_t vfread(void* _Buffer, size_t _ElementSize, size_t _ElementCount, VFILE* _Stream)
 {
 	if (_Stream->fp)
+	{
+#if defined(__vita__)
+		return CdCachedRead(_Buffer, _ElementSize, _ElementCount, _Stream->fp);
+#else
 		return fread(_Buffer, _ElementSize, _ElementCount, _Stream->fp);
+#endif
+	}
 
 	size_t num_to_read = _ElementSize * _ElementCount;
 
@@ -59,7 +111,17 @@ size_t vfread(void* _Buffer, size_t _ElementSize, size_t _ElementCount, VFILE* _
 int vfseek(VFILE* _Stream, int  _Offset, int   _Origin)
 {
 	if (_Stream->fp)
+	{
+#if defined(__vita__)
+		if (_Origin == SEEK_SET) { s_vPos = _Offset; return 0; }
+		if (_Origin == SEEK_CUR && s_vPos >= 0) { s_vPos += _Offset; return 0; }
+		int r = fseek(_Stream->fp, _Offset, _Origin);
+		s_vPos = s_fPos = ftell(_Stream->fp);
+		return r;
+#else
 		return fseek(_Stream->fp, _Offset, _Origin);
+#endif
+	}
 
 	if (_Origin == SEEK_SET)
 		_Stream->curPtr = _Stream->basePtr + _Offset;
@@ -74,7 +136,13 @@ int vfseek(VFILE* _Stream, int  _Offset, int   _Origin)
 int vftell(VFILE* _Stream)
 {
 	if (_Stream->fp)
+	{
+#if defined(__vita__)
+		if (s_vPos >= 0)
+			return (int)s_vPos;
+#endif
 		return ftell(_Stream->fp);
+	}
 
 	return _Stream->curPtr - _Stream->basePtr;
 }
@@ -88,6 +156,60 @@ enum ReadMode
 };
 
 enum ReadMode readMode = RM_DATA;
+
+#if defined(__vita__)
+static size_t CdCachedRead(void* buf, size_t es, size_t ec, FILE* fp)
+{
+	const size_t n = es * ec;
+	const long ss = g_cdSectorSize;
+
+	if (s_vPos < 0)
+		s_vPos = s_fPos = ftell(fp);
+
+	if (readMode != RM_DATA || ss <= 0 || ss > CD_SECTOR_SIZE_MODE2 || n == 0 ||
+	    (s_vPos % ss) != 0 || (n % ss) != 0 || !CdCacheReady())
+		return es ? CdFileRead(buf, n, fp) / es : 0;
+
+	u_char* out = (u_char*)buf;
+	size_t done = 0;
+	while (done < n)
+	{
+		const int idx = (int)(s_vPos / ss);
+		const int slot = idx % CDC_SLOTS;
+		if (s_cdcTag[slot] == idx)
+		{
+			memcpy(out + done, s_cdcData + (size_t)slot * ss, ss);
+			s_vPos += ss;
+			done += ss;
+			g_cdcStats[0]++;
+			continue;
+		}
+		/* Read the whole run of missing sectors in one call. */
+		int run = 1;
+		while (done + (size_t)run * ss < n)
+		{
+			const int j = idx + run;
+			if (s_cdcTag[j % CDC_SLOTS] == j)
+				break;
+			run++;
+		}
+		const size_t want = (size_t)run * ss;
+		const size_t got = CdFileRead(out + done, want, fp);
+		const int full = (int)(got / ss);
+		for (int k = 0; k < full; k++)
+		{
+			const int sl = (idx + k) % CDC_SLOTS;
+			memcpy(s_cdcData + (size_t)sl * ss, out + done + (size_t)k * ss, ss);
+			s_cdcTag[sl] = idx + k;
+		}
+		g_cdcStats[1] += full;
+		done += got;
+		if (got < want)
+			break;
+	}
+	return done / es;
+}
+#endif
 
 int CD_Debug = 0;
 VFILE g_imageFile = { NULL };
@@ -672,6 +794,11 @@ int OpenBinaryImageFile()
 			eprinterr("CD image '%s' not found.\n", g_cdImageBinaryFileName);
 			return 0;
 		}
+#if defined(__vita__)
+		/* Fewer, larger sceIoRead calls for sequential sector reads. */
+		setvbuf(g_imageFile.fp, NULL, _IOFBF, 128 * 1024);
+		s_vPos = s_fPos = 0;
+#endif
 	}
 
 	vfseek(&g_imageFile, 0, SEEK_END);

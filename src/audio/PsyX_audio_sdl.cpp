@@ -2,6 +2,10 @@
 #include "PsyX_audio_sink.h"
 
 #include <SDL.h>
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+extern "C" int VGLR_HelperCoreMask(void);
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -159,6 +163,16 @@ private:
 
 	static void audioCallback(void* userdata, Uint8* stream, int length)
 	{
+#if defined(__vita__)
+		/* The software SPU mixes here; SDL leaves the thread on any core,
+		 * including the game thread's. */
+		static bool pinned = false;
+		if (!pinned)
+		{
+			sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), VGLR_HelperCoreMask());
+			pinned = true;
+		}
+#endif
 		static_cast<SdlSink*>(userdata)->render(stream, length);
 	}
 

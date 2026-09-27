@@ -7,6 +7,104 @@ extern "C" {
 	
 /* Psy-X specific calls */
 	
+#if defined(__vita__)
+/* Vita: the register moves are inline so the per-register switch folds away at
+ * each call site (the reg number is a constant in every gte_* macro). As
+ * out-of-line calls they were a large part of the world-draw time: SH1's
+ * lighting and projection loops issue about a dozen of them per vertex. Same
+ * semantics as the definitions in inline_c.c. */
+#if defined(_LANGUAGE_C_PLUS_PLUS)||defined(__cplusplus)||defined(c_plusplus)
+}
+#endif
+#include "gtereg.h"
+#if defined(_LANGUAGE_C_PLUS_PLUS)||defined(__cplusplus)||defined(c_plusplus)
+extern "C" {
+#endif
+extern unsigned int gte_leadingzerocount(unsigned int lzcs);
+
+static inline unsigned int MFC2(int reg)
+{
+	switch (reg) {
+	case 1: case 3: case 5: case 8: case 9: case 10: case 11:
+		gteRegs.CP2D.p[reg].d = (int)gteRegs.CP2D.p[reg].sw.l;
+		break;
+	case 7: case 16: case 17: case 18: case 19:
+		gteRegs.CP2D.p[reg].d = (unsigned int)gteRegs.CP2D.p[reg].w.l;
+		break;
+	case 15:
+		gteRegs.CP2D.p[reg].d = gteRegs.CP2D.p[14].d;
+		break;
+	case 28: case 29:
+		gteRegs.CP2D.p[reg].d = LIM(gteRegs.CP2D.p[9].sw.l >> 7, 0x1f, 0, 0) |
+		                        (LIM(gteRegs.CP2D.p[10].sw.l >> 7, 0x1f, 0, 0) << 5) |
+		                        (LIM(gteRegs.CP2D.p[11].sw.l >> 7, 0x1f, 0, 0) << 10);
+		break;
+	}
+	return gteRegs.CP2D.p[reg].d;
+}
+
+static inline int MFC2_S(int reg)
+{
+	return (int)MFC2(reg);
+}
+
+static inline void MTC2(unsigned int value, int reg)
+{
+	switch (reg) {
+	case 15:
+		gteRegs.CP2D.p[12].d = gteRegs.CP2D.p[13].d;
+		gteRegs.CP2D.p[13].d = gteRegs.CP2D.p[14].d;
+		gteRegs.CP2D.p[14].d = value;
+		break;
+	case 28:
+		gteRegs.CP2D.p[9].sw.l  = (short)((value & 0x1f) << 7);
+		gteRegs.CP2D.p[10].sw.l = (short)((value & 0x3e0) << 2);
+		gteRegs.CP2D.p[11].sw.l = (short)((value & 0x7c00) >> 3);
+		break;
+	case 30:
+		gteRegs.CP2D.p[31].d = gte_leadingzerocount(value);
+		break;
+	case 31:
+		return;
+	}
+	gteRegs.CP2D.p[reg].d = value;
+}
+
+static inline void MTC2_S(int value, int reg)
+{
+	MTC2((unsigned int)value, reg);
+}
+
+static inline void CTC2(unsigned int value, int reg)
+{
+	switch (reg) {
+	case 4: case 12: case 20: case 26: case 27: case 29: case 30:
+		value = (int)(short)value;
+		break;
+	case 31:
+		value = value & 0x7ffff000;
+		if ((value & 0x7f87e000) != 0)
+			value |= 0x80000000;
+		break;
+	}
+	gteRegs.CP2C.p[reg].d = value;
+}
+
+static inline void CTC2_S(int value, int reg)
+{
+	CTC2((unsigned int)value, reg);
+}
+
+static inline unsigned int CFC2(int reg)
+{
+	return gteRegs.CP2C.p[reg].d;
+}
+
+static inline int CFC2_S(int reg)
+{
+	return gteRegs.CP2C.p[reg].sd;
+}
+#else
 /* sets cop2 data register value. LWC2 is the same kind*/
 extern void MTC2(unsigned int value, int reg);
 extern void MTC2_S(int value, int reg);
@@ -22,6 +120,7 @@ extern int MFC2_S(int reg);
 /* returns cop2 control register value */
 extern unsigned int CFC2(int reg);
 extern int CFC2_S(int reg);
+#endif
 
 /* performs cop2 opcode */
 extern int doCOP2(int op);

@@ -3,6 +3,7 @@
 #include "psx/gtereg.h"
 #include "../gte/PsyX_GTE.h"
 
+#if !defined(__vita__)
 unsigned int MFC2(int reg)
 {
 	switch (reg) {
@@ -179,6 +180,7 @@ int CFC2_S(int reg)
 
 	return gteRegs.CP2C.p[reg].sd;
 }
+#endif
 
 int doCOP2(int op)
 {
