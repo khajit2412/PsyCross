@@ -1,4 +1,7 @@
 #include "PsyX_GPU.h"
+#if defined(__vita__)
+#include <malloc.h>
+#endif
 
 #include "PsyX/PsyX_public.h"
 #include "PsyX/PsyX_globals.h"
@@ -61,7 +64,22 @@ extern "C" unsigned PGXP_CurGen(void) { return s_pgxpGen; }
 /* Shadow entry: precise projection of the word at `key`. value = the packed
  * integer (s16 x | s16 y<<16) that lives at key; a draw that reused the address
  * with a different value falls to affine. */
+#if defined(__vita__)
+/* Vita: the PGXP precise projection and the flashlight view-space position of a
+ * vertex word share one 64-byte entry (one cache line) keyed once: every store,
+ * prim copy and lookup touched two tables in separate cache lines before, which
+ * was a large share of the per-vertex cost. hasP/hasV say which half is live;
+ * each half keeps its own validating word value. */
+struct ShadowEntry {
+	uintptr_t key; unsigned gen; unsigned value; unsigned vvalue;
+	unsigned char hasP, hasV, pad0, pad1;
+	float x, y, w;
+	float vx, vy, vz, nocast, fade, ofx, ofy, h;
+};
+typedef ShadowEntry VsEntry;
+#else
 struct ShadowEntry { uintptr_t key; unsigned gen; unsigned value; float x, y, w; };
+#endif
 /* Must hold every projected vertex word AND every copied prim-field word for one
  * frame (~230k verts -> up to ~1M words). 2^21 open-addressed, 16-probe. */
 #if defined(__vita__)
@@ -90,6 +108,54 @@ static inline unsigned ShadowHash(uintptr_t k) {
 	return (unsigned)((k >> 2) * 2654435761u) & SHADOW_MASK;
 #endif
 }
+#if defined(__vita__)
+static_assert(sizeof(ShadowEntry) == 64, "one cache line per entry");
+
+static ShadowEntry* Sh_Slot(uintptr_t k) {
+	if (s_shadow == nullptr)
+	{
+		s_shadow = (ShadowEntry*)memalign(64, SHADOW_SIZE * sizeof(ShadowEntry));
+		if (s_shadow == nullptr)
+			return nullptr;
+		memset(s_shadow, 0, SHADOW_SIZE * sizeof(ShadowEntry));
+	}
+	const unsigned s = ShadowHash(k);
+	ShadowEntry* e = nullptr;
+	for (int i = 0; i < 16; i++) {
+		ShadowEntry* c = &s_shadow[(s + i) & SHADOW_MASK];
+		if (c->key == k || c->key == 0 || c->gen != s_pgxpGen) { e = c; break; }
+	}
+	if (e == nullptr)
+		e = &s_shadow[s];   /* probe exhausted: overwrite base */
+	if (e->key != k || e->gen != s_pgxpGen) {
+		e->key = k; e->gen = s_pgxpGen; e->hasP = 0; e->hasV = 0;
+	}
+	return e;
+}
+
+static const ShadowEntry* Sh_Find(uintptr_t k) {
+	if (s_shadow == nullptr)
+		return nullptr;
+	const unsigned s = ShadowHash(k);
+	for (int i = 0; i < 16; i++) {
+		const ShadowEntry* e = &s_shadow[(s + i) & SHADOW_MASK];
+		if (e->key == 0 || e->gen != s_pgxpGen) return nullptr;
+		if (e->key == k) return e;
+	}
+	return nullptr;
+}
+
+static void Shadow_Put(void* addr, float x, float y, float w, unsigned value) {
+	ShadowEntry* e = Sh_Slot((uintptr_t)addr);
+	if (!e) return;
+	e->hasP = 1; e->value = value; e->x = x; e->y = y; e->w = w;
+}
+
+static const ShadowEntry* Shadow_Get(const void* addr) {
+	const ShadowEntry* e = Sh_Find((uintptr_t)addr);
+	return (e && e->hasP) ? e : nullptr;
+}
+#else
 
 static void Shadow_Put(void* addr, float x, float y, float w, unsigned value) {
 #if defined(__vita__)
@@ -125,6 +191,8 @@ static const ShadowEntry* Shadow_Get(const void* addr) {
 	}
 	return nullptr;
 }
+
+#endif
 
 /* GTE store hook (DuckStation SWC2, done at source level): record the precise
  * projection of the word just written to `addr`. Called from the gte_stsxy*
@@ -165,6 +233,20 @@ extern "C" float g_PsyX_CharaFade = 0.0f;
  * a lighting helper and restores only the GTE registers, and the various drawers
  * each push their own SetGeomScreen. A frame-global therefore reprojects clip
  * vertices with whichever values the LAST RTPS of the frame happened to leave. */
+#if defined(__vita__)
+static void Vs_Put(void* addr, float vx, float vy, float vz, float nocast, unsigned value,
+                   float ofx, float ofy, float h, float fade = 0.0f) {
+	ShadowEntry* e = Sh_Slot((uintptr_t)addr);
+	if (!e) return;
+	e->hasV = 1; e->vvalue = value; e->vx = vx; e->vy = vy; e->vz = vz; e->nocast = nocast;
+	e->fade = fade; e->ofx = ofx; e->ofy = ofy; e->h = h;
+}
+
+static const VsEntry* Vs_Get(const void* addr, unsigned value) {
+	const ShadowEntry* e = Sh_Find((uintptr_t)addr);
+	return (e && e->hasV && e->vvalue == value) ? e : nullptr;
+}
+#else
 struct VsEntry { uintptr_t key; unsigned gen; unsigned value; float vx, vy, vz; float nocast; float fade; float ofx, ofy, h; };
 #if defined(__vita__)
 static VsEntry* s_vshadow = nullptr;
@@ -207,6 +289,8 @@ static const VsEntry* Vs_Get(const void* addr, unsigned value) {
 	return nullptr;
 }
 
+#endif
+
 /* GTE store hook for the flashlight view-space FIFO (PsyX_GTE.cpp PGXP_StoreAddr,
  * fired when g_PsyX_UsePerPixelFlashlight). The packed vertex word is already at
  * addr when the hook fires (same contract as PGXP's Shadow_Store). */
@@ -230,6 +314,30 @@ extern "C" void VShadow_Store(void* addr, float vx, float vy, float vz, float of
 extern "C" void Shadow_Copy(void* dst, const void* src) {
 #if defined(__vita__)
 	g_vitaProfCnt[2]++;
+#endif
+#if defined(__vita__)
+	{
+		const int wantP = g_PsxUsePgxp, wantV = GR_NeedViewSpaceData();
+		const ShadowEntry* se = Sh_Find((uintptr_t)src);
+		if (!se)
+			return;
+		const unsigned srcVal = *(const unsigned*)src;
+		const int copyP = wantP && se->hasP;
+		const int copyV = wantV && se->hasV && se->vvalue == srcVal;
+		if (!copyP && !copyV)
+			return;
+		const ShadowEntry sv = *se;
+		ShadowEntry* de = Sh_Slot((uintptr_t)dst);
+		if (!de)
+			return;
+		const unsigned dstVal = *(const unsigned*)dst;
+		if (copyP) { de->hasP = 1; de->value = dstVal; de->x = sv.x; de->y = sv.y; de->w = sv.w; }
+		if (copyV) {
+			de->hasV = 1; de->vvalue = dstVal; de->vx = sv.vx; de->vy = sv.vy; de->vz = sv.vz;
+			de->nocast = sv.nocast; de->fade = sv.fade; de->ofx = sv.ofx; de->ofy = sv.ofy; de->h = sv.h;
+		}
+		return;
+	}
 #endif
 	if (g_PsxUsePgxp) {
 		const ShadowEntry* e = Shadow_Get(src);
@@ -3282,6 +3390,9 @@ static void ShadowPassDraw(int startVertex, int numVerts)
  * unchanged light means the map already holds this frame's shadows. */
 static unsigned ShadowCasterHash(void)
 {
+	/* Raw vertex fields the caster test and the pass read (position, cast and
+	 * valid flags) over every opaque split, in one branch-free pass: anything
+	 * that could change the map changes the hash. 0 = no candidate geometry. */
 	unsigned h = 2166136261u, n = 0;
 
 	for (int i = 1; i <= g_splitIndex; i++)
@@ -3289,21 +3400,19 @@ static unsigned ShadowCasterHash(void)
 		const GPUDrawSplit& s = g_splits[i];
 		if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3 || s.blendMode != BM_NONE)
 			continue;
-		for (int offset = 0; offset + 2 < s.numVerts; offset += 3)
+		const GrVertex* v = &s_drawVerts[s.startVertex];
+		for (int k = 0; k < s.numVerts; k++)
 		{
-			const GrVertex* v = &s_drawVerts[s.startVertex + offset];
-			if (!ShadowTriangleCanCast(v))
-				continue;
-			for (int k = 0; k < 3; k++)
-			{
-				unsigned w[3];
-				memcpy(w, &v[k].vsx, sizeof(w));
-				h = (h ^ w[0]) * 16777619u;
-				h = (h ^ w[1]) * 16777619u;
-				h = (h ^ w[2]) * 16777619u;
-			}
-			n++;
+			unsigned w[5];
+			memcpy(&w[0], &v[k].vsx, 12);
+			memcpy(&w[3], &v[k].nx, 8);
+			h = (h ^ w[0]) * 16777619u;
+			h = (h ^ w[1]) * 16777619u;
+			h = (h ^ w[2]) * 16777619u;
+			h = (h ^ w[3]) * 16777619u;
+			h = (h ^ w[4]) * 16777619u;
 		}
+		n += (unsigned)s.numVerts;
 	}
 	return n ? (h | 1u) : 0u;
 }
@@ -3700,6 +3809,10 @@ void DrawAllSplits()
 				GR_ShadowMapWritten(casterHash);
 #endif
 			}
+#if defined(__vita__)
+			else
+				GR_ShadowMapKeep();
+#endif
 		}
 	}
 
