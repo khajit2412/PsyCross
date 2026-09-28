@@ -727,31 +727,189 @@ float g_vitaLeanDim   = 1.0f;
 int   g_vitaBeamCull  = 1;
 static struct { float o[3], d[3], cosA, sinA, range, dim; int on; } s_beam;
 
+extern float g_PsyX_FogColor[3];
+extern float g_PsyX_FogStrength;
+extern int g_PsxPresentLastFrame;
+extern int g_PsxSkipFramebufferStore;
+extern "C" int g_PsxVoidProbeArmed;
+extern "C" int g_PsxPgxpWorldFarBias;
+static float g_shadowLightMatrix[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+
+#if defined(PSYX_VITA)
+/* Frame jobs (vita_frame_packet): the render thread runs DrawAllSplits' draw
+ * loop while the game thread already works on the next frame and rewrites
+ * these. Each job carries a copy taken at submit; RS() reads that copy on the
+ * render thread inside a job and the live value everywhere else. */
+extern "C" float g_PgxpFarWClamp;
+extern "C" float g_PsxFeedbackDampBlend;
+extern int g_PsyX_ForceItemDepth;
+extern "C" int VGLR_OnRenderThread(void);
+extern "C" void VGLR_JobFence(void);
+struct GR_RSnap
+{
+	decltype(::g_PsyX_UsePerPixelFlashlight) g_PsyX_UsePerPixelFlashlight;
+	decltype(::g_PsyX_FlashlightActive) g_PsyX_FlashlightActive;
+	decltype(::g_PsyX_FlashlightStyle) g_PsyX_FlashlightStyle;
+	decltype(::g_PsyX_FlashlightColor) g_PsyX_FlashlightColor;
+	decltype(::g_PsyX_FlashlightDir) g_PsyX_FlashlightDir;
+	decltype(::g_PsyX_FlashlightPos) g_PsyX_FlashlightPos;
+	decltype(::g_PsyX_FlashlightFpsMode) g_PsyX_FlashlightFpsMode;
+	decltype(::g_PsyX_FlashlightInnerCos) g_PsyX_FlashlightInnerCos;
+	decltype(::g_PsyX_FlashlightOuterCos) g_PsyX_FlashlightOuterCos;
+	decltype(::g_PsyX_FlashlightIntensity) g_PsyX_FlashlightIntensity;
+	decltype(::g_PsyX_FlashlightIntensityFps) g_PsyX_FlashlightIntensityFps;
+	decltype(::g_PsyX_FlashlightSize) g_PsyX_FlashlightSize;
+	decltype(::g_PsyX_FlashlightSizeFps) g_PsyX_FlashlightSizeFps;
+	decltype(::g_PsyX_FlashlightRange) g_PsyX_FlashlightRange;
+	decltype(::g_PsyX_FlashlightShadowBias) g_PsyX_FlashlightShadowBias;
+	decltype(::g_PsyX_FlashlightShadowFadeDist) g_PsyX_FlashlightShadowFadeDist;
+	decltype(::g_PsyX_FlashlightShadowNormalOffset) g_PsyX_FlashlightShadowNormalOffset;
+	decltype(::g_PsyX_FlashlightShadowStrength) g_PsyX_FlashlightShadowStrength;
+	decltype(::g_PsyX_UseFlashlightShadows) g_PsyX_UseFlashlightShadows;
+	decltype(::g_PsyX_ShadowsAllowed) g_PsyX_ShadowsAllowed;
+	decltype(::g_PsyX_FogColor) g_PsyX_FogColor;
+	decltype(::g_PsyX_FogStrength) g_PsyX_FogStrength;
+	decltype(::g_PsxDitherSuppressed) g_PsxDitherSuppressed;
+	decltype(::g_PsxPresentLastFrame) g_PsxPresentLastFrame;
+	decltype(::g_PsxVoidProbeArmed) g_PsxVoidProbeArmed;
+	decltype(::g_PsxUsePgxp) g_PsxUsePgxp;
+	decltype(::g_PsxPgxpWorldFarBias) g_PsxPgxpWorldFarBias;
+	decltype(::g_PgxpFarWClamp) g_PgxpFarWClamp;
+	decltype(::g_PsxFeedbackDampBlend) g_PsxFeedbackDampBlend;
+	decltype(::g_PsyX_ForceItemDepth) g_PsyX_ForceItemDepth;
+	decltype(::g_shadowLightMatrix) g_shadowLightMatrix;
+	decltype(::g_shadowZNear) g_shadowZNear;
+	decltype(::g_shadowZFar) g_shadowZFar;
+	decltype(::activeDispEnv) activeDispEnv;
+	decltype(::g_PcHorPlusEnabled) g_PcHorPlusEnabled;
+	decltype(::g_PcMenuPillarbox) g_PcMenuPillarbox;
+	decltype(::g_PcWidescreenMode) g_PcWidescreenMode;
+	decltype(::g_PsxAspectRaw) g_PsxAspectRaw;
+	decltype(::g_PsxCutsceneActive) g_PsxCutsceneActive;
+	decltype(::g_PsxCutsceneVScale) g_PsxCutsceneVScale;
+	decltype(::g_PsxItemTakeActive) g_PsxItemTakeActive;
+	decltype(::g_PsxSkipFramebufferStore) g_PsxSkipFramebufferStore;
+	decltype(::g_PsxUIOrthoPass) g_PsxUIOrthoPass;
+	decltype(::g_PsxWorldVCropAnchor) g_PsxWorldVCropAnchor;
+	decltype(::g_PsxWorldHScale) g_PsxWorldHScale;
+	decltype(::g_PsxWorldVScale) g_PsxWorldVScale;
+	decltype(::g_PsxWorldVShift) g_PsxWorldVShift;
+	decltype(::g_windowWidth) g_windowWidth;
+	decltype(::g_windowHeight) g_windowHeight;
+	decltype(::g_vitaBeamCull) g_vitaBeamCull;
+	float szMax;
+};
+static GR_RSnap     s_rs;
+static volatile int s_rsJob = 0;
+
+static inline int GR_InJob(void)
+{
+	return s_rsJob && VGLR_OnRenderThread();
+}
+#define RS(x) (GR_InJob() ? s_rs.x : (x))
+#define RS_SZMAX() (GR_InJob() ? s_rs.szMax : PGXP_GetSzMax())
+
+extern "C" int GR_RSnapSize(void)
+{
+	return (int)sizeof(GR_RSnap);
+}
+
+extern "C" void GR_RSnapCapture(void* dst)
+{
+	GR_RSnap* r = (GR_RSnap*)dst;
+	memcpy(&r->g_PsyX_UsePerPixelFlashlight, &g_PsyX_UsePerPixelFlashlight, sizeof(r->g_PsyX_UsePerPixelFlashlight));
+	memcpy(&r->g_PsyX_FlashlightActive, &g_PsyX_FlashlightActive, sizeof(r->g_PsyX_FlashlightActive));
+	memcpy(&r->g_PsyX_FlashlightStyle, &g_PsyX_FlashlightStyle, sizeof(r->g_PsyX_FlashlightStyle));
+	memcpy(&r->g_PsyX_FlashlightColor, &g_PsyX_FlashlightColor, sizeof(r->g_PsyX_FlashlightColor));
+	memcpy(&r->g_PsyX_FlashlightDir, &g_PsyX_FlashlightDir, sizeof(r->g_PsyX_FlashlightDir));
+	memcpy(&r->g_PsyX_FlashlightPos, &g_PsyX_FlashlightPos, sizeof(r->g_PsyX_FlashlightPos));
+	memcpy(&r->g_PsyX_FlashlightFpsMode, &g_PsyX_FlashlightFpsMode, sizeof(r->g_PsyX_FlashlightFpsMode));
+	memcpy(&r->g_PsyX_FlashlightInnerCos, &g_PsyX_FlashlightInnerCos, sizeof(r->g_PsyX_FlashlightInnerCos));
+	memcpy(&r->g_PsyX_FlashlightOuterCos, &g_PsyX_FlashlightOuterCos, sizeof(r->g_PsyX_FlashlightOuterCos));
+	memcpy(&r->g_PsyX_FlashlightIntensity, &g_PsyX_FlashlightIntensity, sizeof(r->g_PsyX_FlashlightIntensity));
+	memcpy(&r->g_PsyX_FlashlightIntensityFps, &g_PsyX_FlashlightIntensityFps, sizeof(r->g_PsyX_FlashlightIntensityFps));
+	memcpy(&r->g_PsyX_FlashlightSize, &g_PsyX_FlashlightSize, sizeof(r->g_PsyX_FlashlightSize));
+	memcpy(&r->g_PsyX_FlashlightSizeFps, &g_PsyX_FlashlightSizeFps, sizeof(r->g_PsyX_FlashlightSizeFps));
+	memcpy(&r->g_PsyX_FlashlightRange, &g_PsyX_FlashlightRange, sizeof(r->g_PsyX_FlashlightRange));
+	memcpy(&r->g_PsyX_FlashlightShadowBias, &g_PsyX_FlashlightShadowBias, sizeof(r->g_PsyX_FlashlightShadowBias));
+	memcpy(&r->g_PsyX_FlashlightShadowFadeDist, &g_PsyX_FlashlightShadowFadeDist, sizeof(r->g_PsyX_FlashlightShadowFadeDist));
+	memcpy(&r->g_PsyX_FlashlightShadowNormalOffset, &g_PsyX_FlashlightShadowNormalOffset, sizeof(r->g_PsyX_FlashlightShadowNormalOffset));
+	memcpy(&r->g_PsyX_FlashlightShadowStrength, &g_PsyX_FlashlightShadowStrength, sizeof(r->g_PsyX_FlashlightShadowStrength));
+	memcpy(&r->g_PsyX_UseFlashlightShadows, &g_PsyX_UseFlashlightShadows, sizeof(r->g_PsyX_UseFlashlightShadows));
+	memcpy(&r->g_PsyX_ShadowsAllowed, &g_PsyX_ShadowsAllowed, sizeof(r->g_PsyX_ShadowsAllowed));
+	memcpy(&r->g_PsyX_FogColor, &g_PsyX_FogColor, sizeof(r->g_PsyX_FogColor));
+	memcpy(&r->g_PsyX_FogStrength, &g_PsyX_FogStrength, sizeof(r->g_PsyX_FogStrength));
+	memcpy(&r->g_PsxDitherSuppressed, &g_PsxDitherSuppressed, sizeof(r->g_PsxDitherSuppressed));
+	memcpy(&r->g_PsxPresentLastFrame, &g_PsxPresentLastFrame, sizeof(r->g_PsxPresentLastFrame));
+	memcpy(&r->g_PsxVoidProbeArmed, &g_PsxVoidProbeArmed, sizeof(r->g_PsxVoidProbeArmed));
+	memcpy(&r->g_PsxUsePgxp, &g_PsxUsePgxp, sizeof(r->g_PsxUsePgxp));
+	memcpy(&r->g_PsxPgxpWorldFarBias, &g_PsxPgxpWorldFarBias, sizeof(r->g_PsxPgxpWorldFarBias));
+	memcpy(&r->g_PgxpFarWClamp, &g_PgxpFarWClamp, sizeof(r->g_PgxpFarWClamp));
+	memcpy(&r->g_PsxFeedbackDampBlend, &g_PsxFeedbackDampBlend, sizeof(r->g_PsxFeedbackDampBlend));
+	memcpy(&r->g_PsyX_ForceItemDepth, &g_PsyX_ForceItemDepth, sizeof(r->g_PsyX_ForceItemDepth));
+	memcpy(&r->g_shadowLightMatrix, &g_shadowLightMatrix, sizeof(r->g_shadowLightMatrix));
+	memcpy(&r->g_shadowZNear, &g_shadowZNear, sizeof(r->g_shadowZNear));
+	memcpy(&r->g_shadowZFar, &g_shadowZFar, sizeof(r->g_shadowZFar));
+	memcpy(&r->activeDispEnv, &activeDispEnv, sizeof(r->activeDispEnv));
+	memcpy(&r->g_PcHorPlusEnabled, &g_PcHorPlusEnabled, sizeof(r->g_PcHorPlusEnabled));
+	memcpy(&r->g_PcMenuPillarbox, &g_PcMenuPillarbox, sizeof(r->g_PcMenuPillarbox));
+	memcpy(&r->g_PcWidescreenMode, &g_PcWidescreenMode, sizeof(r->g_PcWidescreenMode));
+	memcpy(&r->g_PsxAspectRaw, &g_PsxAspectRaw, sizeof(r->g_PsxAspectRaw));
+	memcpy(&r->g_PsxCutsceneActive, &g_PsxCutsceneActive, sizeof(r->g_PsxCutsceneActive));
+	memcpy(&r->g_PsxCutsceneVScale, &g_PsxCutsceneVScale, sizeof(r->g_PsxCutsceneVScale));
+	memcpy(&r->g_PsxItemTakeActive, &g_PsxItemTakeActive, sizeof(r->g_PsxItemTakeActive));
+	memcpy(&r->g_PsxSkipFramebufferStore, &g_PsxSkipFramebufferStore, sizeof(r->g_PsxSkipFramebufferStore));
+	memcpy(&r->g_PsxUIOrthoPass, &g_PsxUIOrthoPass, sizeof(r->g_PsxUIOrthoPass));
+	memcpy(&r->g_PsxWorldVCropAnchor, &g_PsxWorldVCropAnchor, sizeof(r->g_PsxWorldVCropAnchor));
+	memcpy(&r->g_PsxWorldHScale, &g_PsxWorldHScale, sizeof(r->g_PsxWorldHScale));
+	memcpy(&r->g_PsxWorldVScale, &g_PsxWorldVScale, sizeof(r->g_PsxWorldVScale));
+	memcpy(&r->g_PsxWorldVShift, &g_PsxWorldVShift, sizeof(r->g_PsxWorldVShift));
+	memcpy(&r->g_windowWidth, &g_windowWidth, sizeof(r->g_windowWidth));
+	memcpy(&r->g_windowHeight, &g_windowHeight, sizeof(r->g_windowHeight));
+	memcpy(&r->g_vitaBeamCull, &g_vitaBeamCull, sizeof(r->g_vitaBeamCull));
+	r->szMax = PGXP_GetSzMax();
+}
+
+extern "C" void GR_RSnapInstall(const void* src)
+{
+	if (src)
+	{
+		memcpy(&s_rs, src, sizeof(s_rs));
+		s_rsJob = 1;
+	}
+	else
+		s_rsJob = 0;
+}
+#else
+#define RS(x) (x)
+#define RS_SZMAX() PGXP_GetSzMax()
+#endif
+
 int GR_VitaBeamBegin(void)
 {
-	float d[3] = { g_PsyX_FlashlightDir[0], g_PsyX_FlashlightDir[1], g_PsyX_FlashlightDir[2] };
+	float d[3] = { RS(g_PsyX_FlashlightDir)[0], RS(g_PsyX_FlashlightDir)[1], RS(g_PsyX_FlashlightDir)[2] };
 	float l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
 
 	if (l2 > 1e-12f) { float il = 1.0f / sqrtf(l2); d[0] *= il; d[1] *= il; d[2] *= il; }
 	else { d[0] = 0.0f; d[1] = 0.0f; d[2] = 1.0f; }
 
-	const float size  = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightSizeFps : g_PsyX_FlashlightSize;
-	const float base  = g_PsyX_FlashlightStyle ? g_PsyX_FlashlightOuterCos : 0.82f;
+	const float size  = RS(g_PsyX_FlashlightFpsMode) ? RS(g_PsyX_FlashlightSizeFps) : RS(g_PsyX_FlashlightSize);
+	const float base  = RS(g_PsyX_FlashlightStyle) ? RS(g_PsyX_FlashlightOuterCos) : 0.82f;
 	float outer = 1.0f - size * (1.0f - base);
 	if (outer < 0.05f) outer = 0.05f;
 
-	const float back = g_PsyX_FlashlightStyle ? 39.0f : 0.0f;
+	const float back = RS(g_PsyX_FlashlightStyle) ? 39.0f : 0.0f;
 	for (int i = 0; i < 3; i++)
 	{
 		s_beam.d[i] = d[i];
-		s_beam.o[i] = g_PsyX_FlashlightPos[i] - d[i] * back;
+		s_beam.o[i] = RS(g_PsyX_FlashlightPos)[i] - d[i] * back;
 	}
 	s_beam.cosA  = outer;
 	s_beam.sinA  = sqrtf(1.0f - outer * outer);
 	/* Classic attenuates on twice the distance and reaches zero at the range. */
-	s_beam.range = g_PsyX_FlashlightStyle ? g_PsyX_FlashlightRange * 0.5f : g_PsyX_FlashlightRange;
-	s_beam.dim   = g_PsyX_FlashlightStyle ? 0.49f : 0.15f;
-	s_beam.on    = g_vitaBeamCull && g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive;
+	s_beam.range = RS(g_PsyX_FlashlightStyle) ? RS(g_PsyX_FlashlightRange) * 0.5f : RS(g_PsyX_FlashlightRange);
+	s_beam.dim   = RS(g_PsyX_FlashlightStyle) ? 0.49f : 0.15f;
+	s_beam.on    = RS(g_vitaBeamCull) && RS(g_PsyX_UsePerPixelFlashlight) && RS(g_PsyX_FlashlightActive);
 	return s_beam.on;
 }
 
@@ -2008,6 +2166,9 @@ void GR_UpdateSwapIntervalState(int swapInterval)
 
 void GR_BeginScene()
 {
+#if defined(PSYX_VITA)
+	VGLR_JobFence();
+#endif
 	g_lastBoundTexture = 0;
 #if defined(PSYX_VITA)
 	GR_VitaPalCacheFrame();
@@ -2298,7 +2459,6 @@ static GLint s_depthLinLocV[2] = { -1, -1 };
 #endif
 static ShaderID g_shadowDepthShader = (ShaderID)-1;
 static GLint g_shadowDepthMatrixLoc = -1;
-static float g_shadowLightMatrix[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
 
 float g_PsyX_FogColor[3] = { 0.0f, 0.0f, 0.0f };
 /* World fog density multiplier. 1.0 = native PC shader fog; >1 deepens it toward the
@@ -2315,6 +2475,7 @@ int g_PsxFogToBlack = 0;
  * scale the source in the fragment shader instead (u_blendSrc). x = colour
  * scale, y = 1 to write x as the source alpha. Set by GR_SetBlendMode. */
 static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
+
 
 /* Colour comes from a CPU-baked table (GR_InitRG8LUT) on texture unit 2
  * instead of being reconstructed per pixel with float division + floor():
@@ -3331,6 +3492,9 @@ int GR_Shader_CheckProgramStatus(GLuint program)
 ShaderID GR_Shader_Compile(const char* source)
 {
 #if defined(PSYX_VITA)
+	VGLR_JobFence();
+#endif
+#if defined(PSYX_VITA)
 	s_uniGen++;
 #endif
 #if defined(ES2_SHADERS)
@@ -3828,8 +3992,8 @@ extern "C" ShaderID Pc_ModernShader_Get(TexFormat);
 #if defined(PSYX_VITA)
 static LitShaderSet* GR_VitaLitSet(void)
 {
-	const int idx = (g_PsyX_FlashlightStyle ? 2 : 0) | (g_PsyX_UseFlashlightShadows ? 1 : 0) |
-	                ((g_PsyX_UseFlashlightShadows && GR_VitaShadowSoft()) ? 4 : 0);
+	const int idx = (RS(g_PsyX_FlashlightStyle) ? 2 : 0) | (RS(g_PsyX_UseFlashlightShadows) ? 1 : 0) |
+	                ((RS(g_PsyX_UseFlashlightShadows) && GR_VitaShadowSoft()) ? 4 : 0);
 	LitShaderSet* set = &s_litSets[idx];
 
 	while (!set->built)
@@ -4161,11 +4325,11 @@ void GR_Perspective3D(const float fov, const float width, const float height, co
 void GR_SetupClipMode(const RECT16* rect, int enable)
 {
 	// [A] isinterlaced dirty hack for widescreen
-	const bool scissorOn = enable && (activeDispEnv.isinter ||
-		(	rect->x - activeDispEnv.disp.x > 0 ||
-			rect->y - activeDispEnv.disp.y > 0 ||
-			rect->w < activeDispEnv.disp.w - 1 ||
-			rect->h < activeDispEnv.disp.h - 1));
+	const bool scissorOn = enable && (RS(activeDispEnv).isinter ||
+		(	rect->x - RS(activeDispEnv).disp.x > 0 ||
+			rect->y - RS(activeDispEnv).disp.y > 0 ||
+			rect->w < RS(activeDispEnv).disp.w - 1 ||
+			rect->h < RS(activeDispEnv).disp.h - 1));
 
 	GR_SetScissorState(scissorOn);
 
@@ -4180,12 +4344,12 @@ void GR_SetupClipMode(const RECT16* rect, int enable)
 	// cause clipping inconsistent with the prim ortho.
 	const float emuScreenAspect = 1.0f;
 
-	const float psxScreenWInv = 1.0f / (float)activeDispEnv.disp.w;
-	const float psxScreenHInv = 1.0f / (float)activeDispEnv.disp.h;
+	const float psxScreenWInv = 1.0f / (float)RS(activeDispEnv).disp.w;
+	const float psxScreenHInv = 1.0f / (float)RS(activeDispEnv).disp.h;
 
 	// first map to 0..1
-	float clipRectX = (float)(rect->x - activeDispEnv.disp.x) * psxScreenWInv;
-	float clipRectY = (float)(rect->y - activeDispEnv.disp.y) * psxScreenHInv;
+	float clipRectX = (float)(rect->x - RS(activeDispEnv).disp.x) * psxScreenWInv;
+	float clipRectY = (float)(rect->y - RS(activeDispEnv).disp.y) * psxScreenHInv;
 	float clipRectW = (float)(rect->w) * psxScreenWInv;
 	float clipRectH = (float)(rect->h) * psxScreenHInv;
 
@@ -4201,11 +4365,11 @@ void GR_SetupClipMode(const RECT16* rect, int enable)
 
 #if USE_OPENGL
 	// adjust scissor rectangle by the backbuffer size (window dimensions)
-	const float flipOffset = g_windowHeight - clipRectH * (float)g_windowHeight;
-	const float crx = clipRectX * (float)g_windowWidth;
-	const float cry = clipRectY * (float)g_windowHeight;
-	const float crw = clipRectW * (float)g_windowWidth;
-	const float crh = clipRectH * (float)g_windowHeight;
+	const float flipOffset = RS(g_windowHeight) - clipRectH * (float)RS(g_windowHeight);
+	const float crx = clipRectX * (float)RS(g_windowWidth);
+	const float cry = clipRectY * (float)RS(g_windowHeight);
+	const float crw = clipRectW * (float)RS(g_windowWidth);
+	const float crh = clipRectH * (float)RS(g_windowHeight);
 
 	glScissor(crx, flipOffset - cry, crw, crh);
 #endif
@@ -4260,30 +4424,30 @@ static int GR_VitaUniformsCurrent(ShaderID prog, TextureID texture, TexFormat te
 	GR_VitaUniSig g;
 	memset(&g, 0, sizeof(g));
 	g.prog = prog;
-	g.pgxp = g_PsxUsePgxp; g.voidProbe = g_PsxVoidProbeArmed == 2; g.fogToBlack = g_PsxFogToBlack;
-	g.flOn = g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive;
-	g.untex = texture == g_whiteTexture; g.flStyle = g_PsyX_FlashlightStyle != 0;
-	g.fpsMode = g_PsyX_FlashlightFpsMode; g.shadowOn = shadowOn;
+	g.pgxp = RS(g_PsxUsePgxp); g.voidProbe = RS(g_PsxVoidProbeArmed) == 2; g.fogToBlack = g_PsxFogToBlack;
+	g.flOn = RS(g_PsyX_UsePerPixelFlashlight) && RS(g_PsyX_FlashlightActive);
+	g.untex = texture == g_whiteTexture; g.flStyle = RS(g_PsyX_FlashlightStyle) != 0;
+	g.fpsMode = RS(g_PsyX_FlashlightFpsMode); g.shadowOn = shadowOn;
 	g.soft = GR_VitaShadowSoft(); g.mapSize = PSYX_SHADOW_MAP_SIZE;
-	g.dither = g_cfg_psxDither; g.winW = g_windowWidth; g.ditherSup = g_PsxDitherSuppressed;
+	g.dither = g_cfg_psxDither; g.winW = RS(g_windowWidth); g.ditherSup = RS(g_PsxDitherSuppressed);
 	g.menuFilter = g_cfg_menuFilter; g.texFormat = texFormat; g.texFilter = g_cfg_textureFilter;
 	g.aniso = g_cfg_anisoLevel;
-	g.szMax = PGXP_GetSzMax(); g.farBias = (float)g_PsxPgxpWorldFarBias; g.farW = g_PgxpFarWClamp;
-	g.fogStr = g_PsyX_FogStrength; g.flDim = g_vitaLeanDim;
-	memcpy(g.fog, g_PsyX_FogColor, sizeof(g.fog));
+	g.szMax = RS_SZMAX(); g.farBias = (float)RS(g_PsxPgxpWorldFarBias); g.farW = RS(g_PgxpFarWClamp);
+	g.fogStr = RS(g_PsyX_FogStrength); g.flDim = g_vitaLeanDim;
+	memcpy(g.fog, RS(g_PsyX_FogColor), sizeof(g.fog));
 	memcpy(g.o, s_beam.o, sizeof(g.o));
 	memcpy(g.d, s_beam.d, sizeof(g.d));
-	memcpy(g.col, g_PsyX_FlashlightColor, sizeof(g.col));
-	g.intens = g_PsyX_FlashlightIntensity; g.intensFps = g_PsyX_FlashlightIntensityFps;
-	g.size = g_PsyX_FlashlightSize; g.sizeFps = g_PsyX_FlashlightSizeFps;
-	g.innerCos = g_PsyX_FlashlightInnerCos; g.outerCos = g_PsyX_FlashlightOuterCos;
-	g.range = g_PsyX_FlashlightRange;
+	memcpy(g.col, RS(g_PsyX_FlashlightColor), sizeof(g.col));
+	g.intens = RS(g_PsyX_FlashlightIntensity); g.intensFps = RS(g_PsyX_FlashlightIntensityFps);
+	g.size = RS(g_PsyX_FlashlightSize); g.sizeFps = RS(g_PsyX_FlashlightSizeFps);
+	g.innerCos = RS(g_PsyX_FlashlightInnerCos); g.outerCos = RS(g_PsyX_FlashlightOuterCos);
+	g.range = RS(g_PsyX_FlashlightRange);
 	if (shadowOn)
 	{
-		memcpy(g.shM, g_shadowLightMatrix, sizeof(g.shM));
-		g.bias = g_PsyX_FlashlightShadowBias; g.nOff = g_PsyX_FlashlightShadowNormalOffset;
-		g.strength = g_PsyX_FlashlightShadowStrength; g.zn = g_shadowZNear; g.zf = g_shadowZFar;
-		g.fade = g_PsyX_FlashlightShadowFadeDist; g.k = GR_VitaShadowSoftK();
+		memcpy(g.shM, RS(g_shadowLightMatrix), sizeof(g.shM));
+		g.bias = RS(g_PsyX_FlashlightShadowBias); g.nOff = RS(g_PsyX_FlashlightShadowNormalOffset);
+		g.strength = RS(g_PsyX_FlashlightShadowStrength); g.zn = RS(g_shadowZNear); g.zf = RS(g_shadowZFar);
+		g.fade = RS(g_PsyX_FlashlightShadowFadeDist); g.k = GR_VitaShadowSoftK();
 	}
 
 	const unsigned slot = (unsigned)prog & 63u;
@@ -4467,9 +4631,9 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	}
 
 #if defined(PSYX_VITA)
-	int shadowOnV = (g_PsyX_UseFlashlightShadows && g_PsyX_UsePerPixelFlashlight &&
-	                 g_PsyX_FlashlightActive && g_shadowDepthTex != 0 &&
-	                 !g_PsxPresentLastFrame) ? 1 : 0;
+	int shadowOnV = (RS(g_PsyX_UseFlashlightShadows) && RS(g_PsyX_UsePerPixelFlashlight) &&
+	                 RS(g_PsyX_FlashlightActive) && g_shadowDepthTex != 0 &&
+	                 !RS(g_PsxPresentLastFrame)) ? 1 : 0;
 	if (GR_VitaShadowZMode() && !s_shadowZStored)
 		shadowOnV = 0;
 	if (u_blendSrcLoc != -1)
@@ -4485,24 +4649,24 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	 * and forced-nearest sampling on actual 3D geometry (visible as
 	 * blocky tree leaves). */
 	if (u_pgxpEnabledLoc != -1)
-		glUniform1i(u_pgxpEnabledLoc, g_PsxUsePgxp);
+		glUniform1i(u_pgxpEnabledLoc, RS(g_PsxUsePgxp));
 
 	/* PGXP depth normalize: prev-frame max SZ. Lets the vertex shader turn each
 	 * vertex's unquantized SZ3 into continuous NDC depth (Z-fight fix). */
 	if (u_szMaxLoc != -1)
-		glUniform1f(u_szMaxLoc, PGXP_GetSzMax());
+		glUniform1f(u_szMaxLoc, RS_SZMAX());
 	if (u_worldFarBiasLoc != -1)
-		glUniform1f(u_worldFarBiasLoc, (float)g_PsxPgxpWorldFarBias);
+		glUniform1f(u_worldFarBiasLoc, (float)RS(g_PsxPgxpWorldFarBias));
 	{
 		extern float g_PgxpFarWClamp;
 		if (u_pgxpFarWLoc != -1)
-			glUniform1f(u_pgxpFarWLoc, g_PgxpFarWClamp);
+			glUniform1f(u_pgxpFarWLoc, RS(g_PgxpFarWClamp));
 	}
 
 	if (u_fogColorLoc != -1)
-		glUniform3fv(u_fogColorLoc, 1, g_PsyX_FogColor);
+		glUniform3fv(u_fogColorLoc, 1, RS(g_PsyX_FogColor));
 	if (u_voidProbeLoc != -1)
-		glUniform1i(u_voidProbeLoc, g_PsxVoidProbeArmed == 2 ? 1 : 0);
+		glUniform1i(u_voidProbeLoc, RS(g_PsxVoidProbeArmed) == 2 ? 1 : 0);
 
 	if (u_fogToBlackLoc != -1)
 		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
@@ -4512,7 +4676,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 #endif
 
 	if (u_fogStrengthLoc != -1)
-		glUniform1f(u_fogStrengthLoc, g_PsyX_FogStrength);
+		glUniform1f(u_fogStrengthLoc, RS(g_PsyX_FogStrength));
 #if defined(PSYX_VITA)
 	if (u_flDimLoc != -1)
 		glUniform1f(u_flDimLoc, g_vitaLeanDim);
@@ -4523,7 +4687,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	 * touches the spotlight branch (and the vsz>0 gate also keeps it off). */
 	if (u_flashlightOnLoc != -1)
 		glUniform1i(u_flashlightOnLoc,
-		            (g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive) ? 1 : 0);
+		            (RS(g_PsyX_UsePerPixelFlashlight) && RS(g_PsyX_FlashlightActive)) ? 1 : 0);
 	/* Untextured splits bind g_whiteTexture; tell the lit tail so the beam's
 	 * albedo falls back to the vertex-lit color instead of full white. Keyed on
 	 * the caller's texture, not g_lastBoundTexture — this block runs before the
@@ -4531,13 +4695,13 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	if (u_untexturedLoc != -1)
 		glUniform1i(u_untexturedLoc, texture == g_whiteTexture ? 1 : 0);
 	if (u_flStyleLoc != -1)
-		glUniform1i(u_flStyleLoc, g_PsyX_FlashlightStyle ? 1 : 0);
+		glUniform1i(u_flStyleLoc, RS(g_PsyX_FlashlightStyle) ? 1 : 0);
 #if defined(PSYX_VITA)
 	if (u_flLightPosLoc != -1)
 		glUniform3fv(u_flLightPosLoc, 1, s_beam.o);
 #else
 	if (u_flLightPosLoc != -1)
-		glUniform3fv(u_flLightPosLoc, 1, g_PsyX_FlashlightPos);
+		glUniform3fv(u_flLightPosLoc, 1, RS(g_PsyX_FlashlightPos));
 #endif
 
 	/* The cone collapses if any of these is degenerate -- a zero direction most of
@@ -4547,19 +4711,19 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		static float s_lastDir[3] = { 9e9f, 9e9f, 9e9f };
 		static int   s_flValLogs  = 0;
 
-		if (g_PsyX_FlashlightActive && s_flValLogs < 24 &&
-		    (g_PsyX_FlashlightDir[0] != s_lastDir[0] ||
-		     g_PsyX_FlashlightDir[1] != s_lastDir[1] ||
-		     g_PsyX_FlashlightDir[2] != s_lastDir[2]))
+		if (RS(g_PsyX_FlashlightActive) && s_flValLogs < 24 &&
+		    (RS(g_PsyX_FlashlightDir)[0] != s_lastDir[0] ||
+		     RS(g_PsyX_FlashlightDir)[1] != s_lastDir[1] ||
+		     RS(g_PsyX_FlashlightDir)[2] != s_lastDir[2]))
 		{
-			s_lastDir[0] = g_PsyX_FlashlightDir[0];
-			s_lastDir[1] = g_PsyX_FlashlightDir[1];
-			s_lastDir[2] = g_PsyX_FlashlightDir[2];
+			s_lastDir[0] = RS(g_PsyX_FlashlightDir)[0];
+			s_lastDir[1] = RS(g_PsyX_FlashlightDir)[1];
+			s_lastDir[2] = RS(g_PsyX_FlashlightDir)[2];
 			s_flValLogs++;
 			eprintf("*[FLVAL] pos=(%.1f,%.1f,%.1f) dir=(%.3f,%.3f,%.3f) range=%.1f style=%d\n",
-			        g_PsyX_FlashlightPos[0], g_PsyX_FlashlightPos[1], g_PsyX_FlashlightPos[2],
-			        g_PsyX_FlashlightDir[0], g_PsyX_FlashlightDir[1], g_PsyX_FlashlightDir[2],
-			        g_PsyX_FlashlightRange, g_PsyX_FlashlightStyle);
+			        RS(g_PsyX_FlashlightPos)[0], RS(g_PsyX_FlashlightPos)[1], RS(g_PsyX_FlashlightPos)[2],
+			        RS(g_PsyX_FlashlightDir)[0], RS(g_PsyX_FlashlightDir)[1], RS(g_PsyX_FlashlightDir)[2],
+			        RS(g_PsyX_FlashlightRange), RS(g_PsyX_FlashlightStyle));
 		}
 	}
 #if defined(PSYX_VITA)
@@ -4567,16 +4731,16 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		glUniform3fv(u_flDirLoc, 1, s_beam.d);
 #else
 	if (u_flDirLoc != -1)
-		glUniform3fv(u_flDirLoc, 1, g_PsyX_FlashlightDir);
+		glUniform3fv(u_flDirLoc, 1, RS(g_PsyX_FlashlightDir));
 #endif
 	/* FPS mode swaps in its own (tighter/dimmer) cone size + brightness. */
-	float flIntensityActive = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightIntensityFps : g_PsyX_FlashlightIntensity;
-	float flSizeActive      = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightSizeFps      : g_PsyX_FlashlightSize;
+	float flIntensityActive = RS(g_PsyX_FlashlightFpsMode) ? RS(g_PsyX_FlashlightIntensityFps) : RS(g_PsyX_FlashlightIntensity);
+	float flSizeActive      = RS(g_PsyX_FlashlightFpsMode) ? RS(g_PsyX_FlashlightSizeFps)      : RS(g_PsyX_FlashlightSize);
 	if (u_flColorLoc != -1) {
 		float flCol[3];
-		flCol[0] = g_PsyX_FlashlightColor[0] * flIntensityActive;
-		flCol[1] = g_PsyX_FlashlightColor[1] * flIntensityActive;
-		flCol[2] = g_PsyX_FlashlightColor[2] * flIntensityActive;
+		flCol[0] = RS(g_PsyX_FlashlightColor)[0] * flIntensityActive;
+		flCol[1] = RS(g_PsyX_FlashlightColor)[1] * flIntensityActive;
+		flCol[2] = RS(g_PsyX_FlashlightColor)[2] * flIntensityActive;
 		glUniform3fv(u_flColorLoc, 1, flCol);
 	}
 	/* Scale cone coverage by g_PsyX_FlashlightSize: a cone's solid angle is
@@ -4586,8 +4750,8 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	{
 		/* Modern style keeps its pre-calibration ~35 deg base cone; the wider
 		 * 0.76 default belongs to the classic (PSX-matched) style. */
-		float baseOuterCos = g_PsyX_FlashlightStyle ? g_PsyX_FlashlightOuterCos : 0.82f;
-		float flInner = 1.0f - flSizeActive * (1.0f - g_PsyX_FlashlightInnerCos);
+		float baseOuterCos = RS(g_PsyX_FlashlightStyle) ? RS(g_PsyX_FlashlightOuterCos) : 0.82f;
+		float flInner = 1.0f - flSizeActive * (1.0f - RS(g_PsyX_FlashlightInnerCos));
 		float flOuter = 1.0f - flSizeActive * (1.0f - baseOuterCos);
 		if (flInner < 0.05f) flInner = 0.05f;
 		if (flOuter < 0.05f) flOuter = 0.05f;
@@ -4597,7 +4761,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 			glUniform1f(u_flOuterCosLoc, flOuter);
 	}
 	if (u_flRangeLoc != -1)
-		glUniform1f(u_flRangeLoc, g_PsyX_FlashlightRange);
+		glUniform1f(u_flRangeLoc, RS(g_PsyX_FlashlightRange));
 
 	/* Flashlight shadow map: same gate as the depth pre-pass in DrawAllSplits, so the
 	 * shader only samples the shadow texture on frames one was actually rendered. */
@@ -4612,9 +4776,9 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		 * right; the pre-pass simply stops refreshing it. The cone's own gate
 		 * (u_flashlightOn) still turns everything off where the flashlight
 		 * itself is inactive. */
-		int shadowOn = (g_PsyX_UseFlashlightShadows && g_PsyX_UsePerPixelFlashlight &&
-		                g_PsyX_FlashlightActive && g_shadowDepthTex != 0 &&
-		                !g_PsxPresentLastFrame) ? 1 : 0;
+		int shadowOn = (RS(g_PsyX_UseFlashlightShadows) && RS(g_PsyX_UsePerPixelFlashlight) &&
+		                RS(g_PsyX_FlashlightActive) && g_shadowDepthTex != 0 &&
+		                !RS(g_PsxPresentLastFrame)) ? 1 : 0;
 #if defined(PSYX_VITA)
 		if (GR_VitaShadowZMode() && !s_shadowZStored)
 			shadowOn = 0;
@@ -4632,9 +4796,9 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 			{
 				s_shadowLogs++;
 				eprintf("[SHADOWDIAG] shadowOn=%d useShadows=%d perPixel=%d flActive=%d tex=%d allowed=%d freeze=%d\n",
-				        shadowOn, g_PsyX_UseFlashlightShadows, g_PsyX_UsePerPixelFlashlight,
-				        g_PsyX_FlashlightActive, (g_shadowDepthTex != 0),
-				        g_PsyX_ShadowsAllowed, g_PsxPresentLastFrame);
+				        shadowOn, RS(g_PsyX_UseFlashlightShadows), RS(g_PsyX_UsePerPixelFlashlight),
+				        RS(g_PsyX_FlashlightActive), (g_shadowDepthTex != 0),
+				        RS(g_PsyX_ShadowsAllowed), RS(g_PsxPresentLastFrame));
 			}
 
 			s_prevShadowOn = shadowOn;
@@ -4645,24 +4809,24 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		if (shadowOn)
 		{
 			if (u_shadowMatrixLoc != -1)
-				glUniformMatrix4fv(u_shadowMatrixLoc, 1, GL_FALSE, g_shadowLightMatrix);
+				glUniformMatrix4fv(u_shadowMatrixLoc, 1, GL_FALSE, RS(g_shadowLightMatrix));
 			if (u_shadowBiasLoc != -1)
-				glUniform1f(u_shadowBiasLoc, g_PsyX_FlashlightShadowBias);
+				glUniform1f(u_shadowBiasLoc, RS(g_PsyX_FlashlightShadowBias));
 			if (u_shadowNormalOffsetLoc != -1)
-				glUniform1f(u_shadowNormalOffsetLoc, g_PsyX_FlashlightShadowNormalOffset);
+				glUniform1f(u_shadowNormalOffsetLoc, RS(g_PsyX_FlashlightShadowNormalOffset));
 			if (u_shadowStrengthLoc != -1)
-				glUniform1f(u_shadowStrengthLoc, g_PsyX_FlashlightShadowStrength);
+				glUniform1f(u_shadowStrengthLoc, RS(g_PsyX_FlashlightShadowStrength));
 			if (u_shadowClipLoc != -1)
 			{
 #if defined(PSYX_VITA)
 				if (GR_VitaShadowSoft())
-					glUniform2f(u_shadowClipLoc, g_shadowZNear, 1.0f / (g_shadowZFar - g_shadowZNear));
+					glUniform2f(u_shadowClipLoc, RS(g_shadowZNear), 1.0f / (RS(g_shadowZFar) - RS(g_shadowZNear)));
 				else
 #endif
-				glUniform2f(u_shadowClipLoc, g_shadowZNear, g_shadowZFar);
+				glUniform2f(u_shadowClipLoc, RS(g_shadowZNear), RS(g_shadowZFar));
 			}
 			if (u_shadowFadeDistLoc != -1)
-				glUniform1f(u_shadowFadeDistLoc, g_PsyX_FlashlightShadowFadeDist);
+				glUniform1f(u_shadowFadeDistLoc, RS(g_PsyX_FlashlightShadowFadeDist));
 			if (u_shadowTexelLoc != -1)
 			{
 #if defined(PSYX_VITA)
@@ -4711,15 +4875,15 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	 * config flag. */
 	if (u_ditherForceLoc != -1)
 		glUniform1f(u_ditherForceLoc,
-		            (g_cfg_psxDither && !g_PsxDitherSuppressed) ? 1.0f : 0.0f);
+		            (g_cfg_psxDither && !RS(g_PsxDitherSuppressed)) ? 1.0f : 0.0f);
 
 	/* Pixel scale = window width / PSX native (320). Scales the dither
 	 * cell so each PSX-pixel-equivalent on screen gets its own matrix
 	 * lookup, keeping the pattern visually proportional to PSX
 	 * regardless of resolution. */
 	if (u_pixelScaleLoc != -1) {
-		float pixelScale = (g_windowWidth > 0)
-			? ((float)g_windowWidth / 320.0f)
+		float pixelScale = (RS(g_windowWidth) > 0)
+			? ((float)RS(g_windowWidth) / 320.0f)
 			: 1.0f;
 		glUniform1f(u_pixelScaleLoc, pixelScale);
 	}
@@ -4750,7 +4914,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	 * also what it looks like on hardware. */
 	if (u_bilinearFilterLoc != -1)
 		glUniform1i(u_bilinearFilterLoc,
-		            g_PsxDitherSuppressed
+		            RS(g_PsxDitherSuppressed)
 		                ? ((g_cfg_menuFilter && texFormat == TF_32_BIT_RGBA) ? 2 : 0)
 		                : ((texFormat == TF_32_BIT_RGBA || g_cfg_textureFilter > 0) ? 1 : 0));
 
@@ -4795,7 +4959,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 {
 	GTEShader* shader;
 #if defined(PSYX_VITA)
-	if (g_vitaForceLean || !(g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive))
+	if (g_vitaForceLean || !(RS(g_PsyX_UsePerPixelFlashlight) && RS(g_PsyX_FlashlightActive)))
 	{
 		if (texFormat == TF_4_BIT) shader = &g_lean_shader_4;
 		else if (texFormat == TF_8_BIT) shader = &g_lean_shader_8;
@@ -5083,7 +5247,7 @@ TextureID GR_VitaPaletteTexture(int key, int* opaque)
 void GR_VitaSetPaletteTexture(TextureID tex, int noDiscard)
 {
 	GTEShader* shader;
-	const int lean = g_vitaForceLean || !(g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive);
+	const int lean = g_vitaForceLean || !(RS(g_PsyX_UsePerPixelFlashlight) && RS(g_PsyX_FlashlightActive));
 
 	if (lean)
 		shader = noDiscard ? &g_lean_shader_32_opaque : &g_lean_shader_32_rgba;
@@ -5260,6 +5424,9 @@ extern "C" void GR_VoidProbeScene(void)
 
 void GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned char g, unsigned char b)
 {
+#if defined(PSYX_VITA)
+	VGLR_JobFence();
+#endif
 	framebuffer_need_update = 1;
 	g_PsxLastClearRGB[0] = r; g_PsxLastClearRGB[1] = g; g_PsxLastClearRGB[2] = b;
 
@@ -5465,6 +5632,9 @@ void GR_ReadFramebufferDataToVRAM()
 	int x, y, w, h;
 	if (!framebuffer_need_update)
 		return;
+#if defined(PSYX_VITA)
+	VGLR_JobFence();
+#endif
 
 	framebuffer_need_update = 0;
 
@@ -5711,10 +5881,10 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 			// The actual viewport for pillarbox is set in the !enable branch
 			// below (search "Pillarbox viewport"); ortho here is matched to
 			// whatever viewport that branch picks.
-			const float psxW = (float)activeDispEnv.disp.w;  // 320
-			float psxH = (float)activeDispEnv.disp.h;   // 224 — aspect/horizontal only
+			const float psxW = (float)RS(activeDispEnv).disp.w;  // 320
+			float psxH = (float)RS(activeDispEnv).disp.h;   // 224 — aspect/horizontal only
 			float orthoTop = 0.0f, orthoBot = psxH;
-			if (g_PcHorPlusEnabled) {
+			if (RS(g_PcHorPlusEnabled)) {
 				/* 3D gameplay world renders ~14.7% too much vertical world (measured: vertical
 				 * scale 0.872 vs DuckStation at a fixed 4:3 spot, horizontal 1.0, top-aligned
 				 * with the extra at the BOTTOM = near foreground). Crop the world ortho to
@@ -5728,19 +5898,19 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 				 * ortho so it isn't scaled/clipped off the bottom. The FIX_ANG framing shift
 				 * (g_PsxWorldVShift) is applied at the GTE projection center by the game, not
 				 * here — an ortho-window shift reveals rows overlay prims never cover. */
-				const float vscale = (g_PsxUIOrthoPass || g_PsxItemTakeActive) ? 1.0f
-				                   : (g_PsxCutsceneActive && g_PsxCutsceneVScale > 0.0f
-				                      ? g_PsxCutsceneVScale : g_PsxWorldVScale);
-				orthoTop = psxH * (1.0f - vscale) * g_PsxWorldVCropAnchor;
+				const float vscale = (RS(g_PsxUIOrthoPass) || RS(g_PsxItemTakeActive)) ? 1.0f
+				                   : (RS(g_PsxCutsceneActive) && RS(g_PsxCutsceneVScale) > 0.0f
+				                      ? RS(g_PsxCutsceneVScale) : RS(g_PsxWorldVScale));
+				orthoTop = psxH * (1.0f - vscale) * RS(g_PsxWorldVCropAnchor);
 				orthoBot = orthoTop + psxH * vscale;
 			}
 			const float psxAspect = psxW / psxH;
-			const float winAspect = (g_windowHeight > 0)
-				? ((float)g_windowWidth / (float)g_windowHeight)
+			const float winAspect = (RS(g_windowHeight) > 0)
+				? ((float)RS(g_windowWidth) / (float)RS(g_windowHeight))
 				: psxAspect;
 			const float horScale = winAspect / psxAspect;
 			fbPsxW   = psxW;
-			fbPsxH   = (float)activeDispEnv.disp.h;
+			fbPsxH   = (float)RS(activeDispEnv).disp.h;
 			fbOrthoT = orthoTop;
 			fbOrthoB = orthoBot;
 			fbOrthoL = 0.0f;
@@ -5754,14 +5924,14 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 			/* The 4:3 paths carry hfov too, so a CRT picture has to drop it here as
 			 * well or pillarbox stays squashed while the widened path is correct --
 			 * which is exactly how the two modes came to disagree. */
-			const float hs43   = (!g_PsxAspectRaw) ? 1.0f
-			                   : ((g_PcHorPlusEnabled && !g_PsxUIOrthoPass) ? g_PsxWorldHScale : 1.0f);
+			const float hs43   = (!RS(g_PsxAspectRaw)) ? 1.0f
+			                   : ((RS(g_PcHorPlusEnabled) && !RS(g_PsxUIOrthoPass)) ? RS(g_PsxWorldHScale) : 1.0f);
 			const float half43 = (psxW * 0.5f) / ((hs43 > 0.0f) ? hs43 : 1.0f);
-			if (!g_PcHorPlusEnabled || horScale <= 1.0f) {
+			if (!RS(g_PcHorPlusEnabled) || horScale <= 1.0f) {
 				/* 2D UI or non-widescreen window: 4:3 ortho, full viewport. */
 				if (hs43 != 1.0f) { fbOrthoL = psxW * 0.5f - half43; fbOrthoR = psxW * 0.5f + half43; }
 				GR_Ortho2D(fbOrthoL, fbOrthoR, orthoBot, orthoTop, -1.0f, 1.0f);
-			} else if (g_PcWidescreenMode == 1) {
+			} else if (RS(g_PcWidescreenMode) == 1) {
 				/* Hor+ widescreen: widen ortho, full-window viewport. PSX_NTSC_PIXEL_ASPECT
 				 * preserves 1 H px = 1 V px scaling for character proportions. */
 				const float effectiveScale = horScale * PSX_NTSC_PIXEL_ASPECT;
@@ -5769,7 +5939,7 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 				/* hfov: scale the horizontal world extent around center (g_PsxWorldHScale).
 				 * 1.0 = identity (-margin..psxW+margin); >1 shrinks the ortho width = wider
 				 * models. Skipped for the UI pass so 2D UI stays aligned. */
-				const float hscale = g_PsxUIOrthoPass ? 1.0f : g_PsxWorldHScale;
+				const float hscale = RS(g_PsxUIOrthoPass) ? 1.0f : RS(g_PsxWorldHScale);
 				const float cx     = psxW * 0.5f;
 				const float halfW  = (psxW * 0.5f + margin) / hscale;
 				fbOrthoL = cx - halfW;
@@ -5791,14 +5961,14 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 			 * Latched on gameplay frames only (the flag is 0 on menu frames) so a
 			 * menu's 4:3 ortho cannot move it. The vertical span is the real one
 			 * too, so a 224-line display no longer masquerades as 240. */
-			if (g_PsxUIOrthoPass) {
+			if (RS(g_PsxUIOrthoPass)) {
 				float ox = 0.0f, oy = 0.0f;
 				PsyX_GetDrawEnvOffset(&ox, &oy);
 				g_PcUiRect[0] = fbOrthoL - ox;
 				g_PcUiRect[1] = fbOrthoR - ox;
 				g_PcUiRect[2] = fbOrthoT - oy;
 				g_PcUiRect[3] = fbOrthoB - oy;
-				if (g_PcHorPlusEnabled) {
+				if (RS(g_PcHorPlusEnabled)) {
 					g_PcHudRect[0] = g_PcUiRect[0];
 					g_PcHudRect[1] = g_PcUiRect[1];
 					g_PcHudRect[2] = g_PcUiRect[2];
@@ -5820,30 +5990,30 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 				static unsigned s_aspSeen[8];
 				static int s_aspSeenN = 0;
 				/* viewport that the block below will pick (recomputed here). */
-				int dbgVpW = g_windowWidth, dbgVpX = 0;
+				int dbgVpW = RS(g_windowWidth), dbgVpX = 0;
 				const bool dbgPillar =
-					(g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
-					(!g_PcHorPlusEnabled && g_PcMenuPillarbox);
-				if (dbgPillar && g_windowHeight > 0 && winAspect > psxAspect) {
-					dbgVpW = (int)(g_windowHeight * psxAspect + 0.5f);
-					dbgVpX = (g_windowWidth - dbgVpW) / 2;
+					(RS(g_PcHorPlusEnabled) && RS(g_PcWidescreenMode) == 0) ||
+					(!RS(g_PcHorPlusEnabled) && RS(g_PcMenuPillarbox));
+				if (dbgPillar && RS(g_windowHeight) > 0 && winAspect > psxAspect) {
+					dbgVpW = (int)(RS(g_windowHeight) * psxAspect + 0.5f);
+					dbgVpX = (RS(g_windowWidth) - dbgVpW) / 2;
 				}
-				const float dbgMargin = (g_PcHorPlusEnabled && horScale > 1.0f && g_PcWidescreenMode == 1)
+				const float dbgMargin = (RS(g_PcHorPlusEnabled) && horScale > 1.0f && RS(g_PcWidescreenMode) == 1)
 					? psxW * (horScale * PSX_NTSC_PIXEL_ASPECT - 1.0f) * 0.5f : 0.0f;
-				unsigned key = ((unsigned)(activeDispEnv.disp.w & 0x3FF) << 22) ^
-					((unsigned)(activeDispEnv.disp.h & 0x3FF) << 12) ^
-					((unsigned)(g_windowWidth & 0xFFF)) ^
-					((unsigned)(g_PcHorPlusEnabled ? 1u : 0u) << 31) ^
-					((unsigned)(g_PcWidescreenMode & 3) << 29);
+				unsigned key = ((unsigned)(RS(activeDispEnv).disp.w & 0x3FF) << 22) ^
+					((unsigned)(RS(activeDispEnv).disp.h & 0x3FF) << 12) ^
+					((unsigned)(RS(g_windowWidth) & 0xFFF)) ^
+					((unsigned)(RS(g_PcHorPlusEnabled) ? 1u : 0u) << 31) ^
+					((unsigned)(RS(g_PcWidescreenMode) & 3) << 29);
 				int seen = 0;
 				for (int i = 0; i < s_aspSeenN; i++) if (s_aspSeen[i] == key) { seen = 1; break; }
 				if (!seen && s_aspSeenN < 8) {
 					s_aspSeen[s_aspSeenN++] = key;
 					fprintf(aspOut, "[ASPECT] disp=%dx%d win=%dx%d psxAspect=%.4f winAspect=%.4f horScale=%.4f HorPlus=%d WS=%d PAR=%.4f margin=%.1f vp=%d+%dx%d C2_H=%d OFX=%d OFY=%d\n",
-						(int)activeDispEnv.disp.w, (int)activeDispEnv.disp.h,
-						g_windowWidth, g_windowHeight, psxAspect, winAspect, horScale,
-						g_PcHorPlusEnabled, g_PcWidescreenMode, (float)PSX_NTSC_PIXEL_ASPECT,
-						dbgMargin, dbgVpX, dbgVpW, g_windowHeight,
+						(int)RS(activeDispEnv).disp.w, (int)RS(activeDispEnv).disp.h,
+						RS(g_windowWidth), RS(g_windowHeight), psxAspect, winAspect, horScale,
+						RS(g_PcHorPlusEnabled), RS(g_PcWidescreenMode), (float)PSX_NTSC_PIXEL_ASPECT,
+						dbgMargin, dbgVpX, dbgVpW, RS(g_windowHeight),
 						(int)C2_H, (int)(C2_OFX >> 16), (int)(C2_OFY >> 16));
 					fflush(aspOut);
 				}
@@ -5858,16 +6028,16 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 		 * mode 0, or for 2D screens (menus/load) when g_PcMenuPillarbox is on;
 		 * otherwise full window (stretch). */
 		{
-			int vpX = 0, vpY = 0, vpW = g_windowWidth, vpH = g_windowHeight;
+			int vpX = 0, vpY = 0, vpW = RS(g_windowWidth), vpH = RS(g_windowHeight);
 			const bool wantPillarbox =
-				(g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
-				(!g_PcHorPlusEnabled && g_PcMenuPillarbox);
-			if (wantPillarbox && g_windowHeight > 0) {
+				(RS(g_PcHorPlusEnabled) && RS(g_PcWidescreenMode) == 0) ||
+				(!RS(g_PcHorPlusEnabled) && RS(g_PcMenuPillarbox));
+			if (wantPillarbox && RS(g_windowHeight) > 0) {
 				const float psxAspect = 4.0f / 3.0f;
-				const float winAspect = (float)g_windowWidth / (float)g_windowHeight;
+				const float winAspect = (float)RS(g_windowWidth) / (float)RS(g_windowHeight);
 				if (winAspect > psxAspect) {
-					vpW = (int)(g_windowHeight * psxAspect + 0.5f);
-					vpX = (g_windowWidth - vpW) / 2;
+					vpW = (int)(RS(g_windowHeight) * psxAspect + 0.5f);
+					vpX = (RS(g_windowWidth) - vpW) / 2;
 				}
 			}
 			GR_SetViewPort(vpX, vpY, vpW, vpH);
@@ -5890,14 +6060,14 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 			{
 				const float sx  = (float)vpW / (fbOrthoR - fbOrthoL);
 				const float sy  = (float)vpH / (fbOrthoB - fbOrthoT);
-				float*      dst = g_PsxUIOrthoPass ? g_psxUiAreaVp : g_psxAreaVp;
+				float*      dst = RS(g_PsxUIOrthoPass) ? g_psxUiAreaVp : g_psxAreaVp;
 
 				dst[0] = (float)vpX + (0.0f    - fbOrthoL) * sx;
 				dst[2] = (float)vpX + (fbPsxW  - fbOrthoL) * sx;
 				dst[3] = (float)(vpY + vpH) - (0.0f   - fbOrthoT) * sy;
 				dst[1] = (float)(vpY + vpH) - (fbPsxH - fbOrthoT) * sy;
 
-				if (g_PsxUIOrthoPass)
+				if (RS(g_PsxUIOrthoPass))
 				{
 					g_psxUiAreaVpValid = 1;
 
@@ -5968,7 +6138,7 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 		 * just-uploaded TIM. The viewport / state-tracking above must still
 		 * run so subsequent draws use the correct framebuffer binding;
 		 * only the writes are suppressed. */
-		if (g_PsxSkipFramebufferStore)
+		if (RS(g_PsxSkipFramebufferStore))
 		{
 			glBindFramebuffer(GL_FRAMEBUFFER, GR_ScreenFBO());
 		}
@@ -6976,10 +7146,10 @@ void GR_ShadowPassBegin(void)
 
 	glUseProgram(g_shadowDepthShader);
 	if (g_shadowDepthMatrixLoc != -1)
-		glUniformMatrix4fv(g_shadowDepthMatrixLoc, 1, GL_FALSE, g_shadowLightMatrix);
+		glUniformMatrix4fv(g_shadowDepthMatrixLoc, 1, GL_FALSE, RS(g_shadowLightMatrix));
 #if defined(PSYX_VITA)
 	if (g_shadowDepthLinLoc != -1)
-		glUniform2f(g_shadowDepthLinLoc, g_shadowZNear, 1.0f / (g_shadowZFar - g_shadowZNear));
+		glUniform2f(g_shadowDepthLinLoc, RS(g_shadowZNear), 1.0f / (RS(g_shadowZFar) - RS(g_shadowZNear)));
 #endif
 }
 
@@ -8154,6 +8324,7 @@ extern "C" void GR_StoreFrameBufferPsx(void)
 #if defined(PSYX_VITA)
 		if (s_fbRectsDirty)
 		{
+			VGLR_JobFence();
 			GR_ClearAllFeedbackRects();
 			s_fbRectsDirty = 0;
 		}
@@ -8176,6 +8347,9 @@ extern "C" void GR_StoreFrameBufferPsx(void)
 		return;
 	}
 
+#if defined(PSYX_VITA)
+	VGLR_JobFence();
+#endif
 	GR_CaptureFrameToPackTex(g_psxDispBuf[0].w, g_psxDispBuf[0].h);
 
 	GR_PackFrameToAllFeedbackRects();
@@ -8517,6 +8691,9 @@ void GR_UpdateVRAM()
 {
 	if (!vram_need_update)
 		return;
+#if defined(PSYX_VITA)
+	VGLR_JobFence();
+#endif
 
 	g_PsyX_VramUploads++;
 	vram_need_update = 0;
@@ -8568,6 +8745,9 @@ void GR_UpdateVRAM()
  * GPU texture after the last GR_UpdateVRAM gets unconditionally overwritten. */
 void GR_DirectUploadVRAMRegion(int x, int y, int w, int h)
 {
+#if defined(PSYX_VITA)
+	VGLR_JobFence();
+#endif
 #if USE_OPENGL
 	if (x < 0 || y < 0 || w <= 0 || h <= 0)
 		return;
@@ -8879,7 +9059,7 @@ void GR_EnableDepth(int enable)
 {
 	/* Track the APPLIED GL state (not the requested `enable`) so toggling
 	 * g_PsyX_ForceItemDepth mid-frame re-applies on the next call. */
-	int applied = ((enable && g_cfg_pgxpZBuffer) || g_PsyX_ForceItemDepth) ? 1 : 0;
+	int applied = ((enable && g_cfg_pgxpZBuffer) || RS(g_PsyX_ForceItemDepth)) ? 1 : 0;
 
 	if (g_PreviousDepthMode == applied)
 		return;
@@ -9030,7 +9210,7 @@ void GR_SetBlendMode(BlendMode blendMode)
 	/* 0.5, not 0.25: the desktop factor is the blend constant's ALPHA, which
 	 * is 0.5 whenever this mode is reached. */
 	g_PsxBlendSrc[0] = (blendMode == BM_ADD_QUATER_SOURCE) ? 0.5f :
-	                   (blendMode == BM_CONSTANT_ALPHA) ? g_PsxFeedbackDampBlend : 1.0f;
+	                   (blendMode == BM_CONSTANT_ALPHA) ? RS(g_PsxFeedbackDampBlend) : 1.0f;
 	g_PsxBlendSrc[1] = (blendMode == BM_CONSTANT_ALPHA) ? 1.0f : 0.0f;
 	if (u_blendSrcLoc != -1)
 		glUniform2fv(u_blendSrcLoc, 1, g_PsxBlendSrc);
@@ -9088,7 +9268,7 @@ void GR_SetBlendMode(BlendMode blendMode)
 		glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE);
 		break;
 	case BM_CONSTANT_ALPHA:
-		glBlendColor(0.25f, 0.25f, 0.25f, g_PsxFeedbackDampBlend);
+		glBlendColor(0.25f, 0.25f, 0.25f, RS(g_PsxFeedbackDampBlend));
 		glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
 		break;
 #endif

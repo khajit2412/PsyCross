@@ -1183,6 +1183,7 @@ extern "C" void (*g_PsyX_PostCaptureHook)(void) = NULL;
 #if defined(__vita__)
 extern "C" unsigned long long g_splitUs[4];
 extern "C" unsigned long long g_submitUs[4];
+extern "C" unsigned g_vitaFrameJobs[2];
 extern "C" unsigned long long g_vitaBeamTris[2];
 extern "C" void GR_VitaShadowStatReport(double frames);
 extern "C" unsigned long long g_vitaProfUs[4];
@@ -1339,6 +1340,11 @@ void PsyX_EndScene()
 			        g_submitUs[0] / n / 1000.0, g_submitUs[1] / n / 1000.0,
 			        g_submitUs[2] / n / 1000.0, g_submitUs[3] / n / 1000.0);
 			memset(g_submitUs, 0, sizeof(g_submitUs));
+			{
+				eprintf("[FRAMEJOB] flushes per frame: render thread=%.2f inline=%.2f (splitLoop above is render-thread time when jobs run)\n",
+				        g_vitaFrameJobs[0] / n, g_vitaFrameJobs[1] / n);
+				memset(g_vitaFrameJobs, 0, sizeof(g_vitaFrameJobs));
+			}
 			if (g_vitaBeamTris[0] + g_vitaBeamTris[1])
 				eprintf("[BEAM] tris/frame: lit=%.0f plain=%.0f litPct=%.0f\n",
 				        g_vitaBeamTris[0] / n, g_vitaBeamTris[1] / n,

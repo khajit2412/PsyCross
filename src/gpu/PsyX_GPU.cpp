@@ -1868,6 +1868,10 @@ struct GPUDrawSplit
 
 	/* Vita hardware-paletted texture key (GR_VitaPaletteTexture), 0 = none. */
 	int				palKey;
+	/* Its texture, resolved on the game thread before the draw (the cache reads
+	 * the CPU VRAM copy, which the next frame may already be changing). */
+	TextureID		palTex;
+	int				palOpaque;
 };
 
 /* 4096 was reached in ordinary play on a dense outdoor map (a user capture hit
@@ -3185,6 +3189,9 @@ extern "C" { unsigned long long g_splitUs[4]; unsigned long long g_submitUs[4]; 
 /* The vertices this flush draws from: g_vertexBuffer, or on Vita the reordered
  * copy Vita_ReorderSplits wrote (saves copying it back). */
 static GrVertex* s_drawVerts = g_vertexBuffer;
+/* The vertices the draw code reads: s_drawVerts inline, the job's copy on the
+ * render thread. */
+static const GrVertex* s_execVerts = g_vertexBuffer;
 
 #if defined(__vita__)
 #define VITA_BEAM_MIN_RUN  12
@@ -3226,8 +3233,8 @@ void DrawSplit(const GPUDrawSplit& split)
 
 	unsigned long long t1 = SPLIT_T();
 #if defined(__vita__)
-	int palOpaque = 0;
-	TextureID palTex = split.palKey ? GR_VitaPaletteTexture(split.palKey, &palOpaque) : 0;
+	const int palOpaque = split.palOpaque;
+	const TextureID palTex = split.palKey ? split.palTex : 0;
 #endif
 	const bool drawOnScreen = split.drawenv.dfe;
 
@@ -3274,7 +3281,7 @@ void DrawSplit(const GPUDrawSplit& split)
 	int beamRuns = 0;
 	if (s_beamOn && nTris >= VITA_BEAM_MIN_RUN && nTris <= VITA_BEAM_MAX_TRIS)
 	{
-		const GrVertex* v = &s_drawVerts[split.startVertex];
+		const GrVertex* v = &s_execVerts[split.startVertex];
 		int lit = 0;
 		for (int i = 0; i < nTris; i++)
 		{
@@ -3445,7 +3452,7 @@ static void DrawShadowCasters(const GPUDrawSplit& split)
 	int runStart = -1;
 	for (int offset = 0; offset + 2 < split.numVerts; offset += 3)
 	{
-		if (ShadowTriangleCanCast(&s_drawVerts[split.startVertex + offset]))
+		if (ShadowTriangleCanCast(&s_execVerts[split.startVertex + offset]))
 		{
 			if (runStart < 0)
 				runStart = offset;
@@ -3752,6 +3759,90 @@ static void Vita_BatchSplits()
 }
 #endif
 
+#if defined(__vita__)
+extern "C" {
+void* VGLR_JobBegin(void (*fn)(void*), size_t bytes);
+void  VGLR_JobEnd(void);
+void  VGLR_JobFence(void);
+int   VGLR_JobsEnabled(void);
+int   GR_RSnapSize(void);
+void  GR_RSnapCapture(void* dst);
+void  GR_RSnapInstall(const void* src);
+/* [FRAMEJOB] flushes per report: 0 = handed to the render thread, 1 = inline. */
+unsigned g_vitaFrameJobs[2];
+}
+
+struct DrawJobHdr { int nSplits, nVerts, shadowPass, rsOff, splitOff, vertOff; };
+
+/* Whether the shadow pass would draw anything, with the same test it uses. */
+static int AnyShadowCaster(void)
+{
+	for (int i = 1; i <= g_splitIndex; i++)
+	{
+		const GPUDrawSplit& s = g_splits[i];
+		if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3 || s.blendMode != BM_NONE)
+			continue;
+		for (unsigned o = 0; o + 2 < s.numVerts; o += 3)
+			if (ShadowTriangleCanCast(&s_drawVerts[s.startVertex + o]))
+				return 1;
+	}
+	return 0;
+}
+
+/* Upload, shadow pass and split loop for one flush: on the game thread when
+ * inline, on the render thread inside a frame job. */
+static void DrawSplitsExec(const GPUDrawSplit* splits, int nSplits, const GrVertex* verts, int nVerts, int shadowPass)
+{
+	const unsigned long long sb1 = SPLIT_T();
+	s_execVerts = verts;
+	GR_UpdateVertexBuffer(verts, nVerts);
+	const unsigned long long sb2 = SPLIT_T();
+
+	if (shadowPass)
+	{
+		s_shadowPassOpen = false;
+		for (int i = 0; i < nSplits; i++)
+		{
+			const GPUDrawSplit& s = splits[i];
+			if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3 || s.blendMode != BM_NONE)
+				continue;
+			DrawShadowCasters(s);
+		}
+		if (s_shadowPassOpen)
+			GR_ShadowPassEnd();
+	}
+	const unsigned long long sb3 = SPLIT_T();
+
+	s_beamOn = GR_VitaBeamBegin();
+	for (int i = 0; i < nSplits; i++)
+	{
+		if (splits[i].kind == GPU_SPLIT_MODERN)
+			GR_DrawModernMesh(splits[i].modernHandle);
+		else if (splits[i].kind == GPU_SPLIT_FBCAPTURE)
+			GR_CaptureFrameToVramRect(splits[i].drawenv.clip.x, splits[i].drawenv.clip.y,
+			                          splits[i].drawenv.clip.w, splits[i].drawenv.clip.h);
+		else
+			DrawSplit(splits[i]);
+	}
+
+	const unsigned long long sb4 = SPLIT_T();
+	g_submitUs[1] += sb2 - sb1;
+	g_submitUs[2] += sb3 - sb2;
+	g_submitUs[3] += sb4 - sb3;
+	s_execVerts = s_drawVerts;
+}
+
+static void DrawSplitsJob(void* payload)
+{
+	const char* p = (const char*)payload;
+	const DrawJobHdr* h = (const DrawJobHdr*)p;
+	GR_RSnapInstall(p + h->rsOff);
+	DrawSplitsExec((const GPUDrawSplit*)(p + h->splitOff), h->nSplits,
+	               (const GrVertex*)(p + h->vertOff), h->nVerts, h->shadowPass);
+	GR_RSnapInstall(NULL);
+}
+#endif
+
 //
 // Draws all polygons after AggregatePTAG
 //
@@ -3787,66 +3878,95 @@ void DrawAllSplits()
 	const unsigned long long sb0 = SPLIT_T();
 	s_drawVerts = g_vertexBuffer;
 	Vita_BatchSplits();
-	const unsigned long long sb1 = SPLIT_T();
-#endif
 
-	// next code ideally should be called before EndScene
-	GR_UpdateVertexBuffer(s_drawVerts, g_vertexIndex);
-#if defined(__vita__)
-	const unsigned long long sb2 = SPLIT_T();
-#endif
+	int inlineOnly = !VGLR_JobsEnabled();
+	for (int i = 1; i <= g_splitIndex; i++)
+	{
+		GPUDrawSplit& s = g_splits[i];
+		if (s.kind != GPU_SPLIT_LEGACY)
+			inlineOnly = 1;
+		else if (s.palKey)
+			s.palTex = GR_VitaPaletteTexture(s.palKey, &s.palOpaque);
+	}
 
-	/* Flashlight shadow map: depth-only pre-pass over the OPAQUE splits from the
-	 * light POV, into the shadow FBO, while the frame VAO is still bound. Only
-	 * BM_NONE (opaque) casts — every semi-transparent mode is skipped so effects
-	 * don't throw hard shadows: additive/subtractive (fire, blood) AND the 50/50
-	 * BM_AVERAGE the PC muzzle flash uses (a quad at the muzzle, right next to the
-	 * close flashlight, was flashing a huge gun/magazine silhouette on the wall
-	 * for the frame or two it existed). Caster eligibility is checked per
-	 * triangle so an invalid or suppressed vertex cannot stretch the remaining
-	 * vertices into a false shadow. */
+	/* The shadow-map decision stays here: it keeps state across frames and
+	 * builds the light matrix the job's snapshot then carries. */
+	int shadowPass = 0;
 	if (GR_FlashlightShadowActive())
 	{
-		s_shadowPassOpen = false;
-#if defined(__vita__)
 		const unsigned casterHash = ShadowCasterHash();
 		if (casterHash == 0)
 			GR_ShadowMapKeep();
 		else if (!GR_ShadowMapCurrent(casterHash))
-#endif
 		{
-			for (int i = 1; i <= g_splitIndex; i++)
+			if (AnyShadowCaster())
 			{
-				const GPUDrawSplit& s = g_splits[i];
-				if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3)
-					continue;
-				if (s.blendMode != BM_NONE)
-					continue;
-				DrawShadowCasters(s);
-			}
-			if (s_shadowPassOpen)
-			{
-				GR_ShadowPassEnd();
-#if defined(__vita__)
+				shadowPass = 1;
 				GR_ShadowMapWritten(casterHash);
-#endif
 			}
-#if defined(__vita__)
 			else
 				GR_ShadowMapKeep();
-#endif
 		}
+	}
+	const unsigned long long sb1 = SPLIT_T();
+	g_submitUs[0] += sb1 - sb0;
+
+	if (g_PsxUsePgxp && g_splitIndex > s_dbgSplitHighWater)
+		s_dbgSplitHighWater = g_splitIndex;
+
+	if (!inlineOnly)
+	{
+		const size_t hdrBytes   = (sizeof(DrawJobHdr) + 7) & ~(size_t)7;
+		const size_t rsBytes    = ((size_t)GR_RSnapSize() + 7) & ~(size_t)7;
+		const size_t splitBytes = ((size_t)g_splitIndex * sizeof(GPUDrawSplit) + 7) & ~(size_t)7;
+		const size_t vertBytes  = (size_t)g_vertexIndex * sizeof(GrVertex);
+		char* p = (char*)VGLR_JobBegin(DrawSplitsJob, hdrBytes + rsBytes + splitBytes + vertBytes);
+		if (p)
+		{
+			DrawJobHdr* h = (DrawJobHdr*)p;
+			h->nSplits    = g_splitIndex;
+			h->nVerts     = g_vertexIndex;
+			h->shadowPass = shadowPass;
+			h->rsOff      = (int)hdrBytes;
+			h->splitOff   = (int)(hdrBytes + rsBytes);
+			h->vertOff    = (int)(hdrBytes + rsBytes + splitBytes);
+			GR_RSnapCapture(p + h->rsOff);
+			memcpy(p + h->splitOff, &g_splits[1], (size_t)g_splitIndex * sizeof(GPUDrawSplit));
+			memcpy(p + h->vertOff, s_drawVerts, vertBytes);
+			VGLR_JobEnd();
+			g_vitaFrameJobs[0]++;
+			ClearSplits();
+			return;
+		}
+	}
+
+	/* Inline: the renderer caches and vertex buffers may still be in use by a
+	 * job from an earlier flush. */
+	VGLR_JobFence();
+	g_vitaFrameJobs[1]++;
+	DrawSplitsExec(&g_splits[1], g_splitIndex, s_drawVerts, g_vertexIndex, shadowPass);
+#else
+	GR_UpdateVertexBuffer(s_drawVerts, g_vertexIndex);
+
+	if (GR_FlashlightShadowActive())
+	{
+		s_shadowPassOpen = false;
+		for (int i = 1; i <= g_splitIndex; i++)
+		{
+			const GPUDrawSplit& s = g_splits[i];
+			if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3)
+				continue;
+			if (s.blendMode != BM_NONE)
+				continue;
+			DrawShadowCasters(s);
+		}
+		if (s_shadowPassOpen)
+			GR_ShadowPassEnd();
 	}
 
 	if (g_PsxUsePgxp && g_splitIndex > s_dbgSplitHighWater)
 		s_dbgSplitHighWater = g_splitIndex;
-#if defined(__vita__)
-	const unsigned long long sb3 = SPLIT_T();
-#endif
 
-#if defined(__vita__)
-	s_beamOn = GR_VitaBeamBegin();
-#endif
 	for (int i = 1; i <= g_splitIndex; i++)
 	{
 		if (g_splits[i].kind == GPU_SPLIT_MODERN)
@@ -3856,14 +3976,6 @@ void DrawAllSplits()
 			                          g_splits[i].drawenv.clip.w, g_splits[i].drawenv.clip.h);
 		else
 			DrawSplit(g_splits[i]);
-	}
-#if defined(__vita__)
-	{
-		const unsigned long long sb4 = SPLIT_T();
-		g_submitUs[0] += sb1 - sb0;
-		g_submitUs[1] += sb2 - sb1;
-		g_submitUs[2] += sb3 - sb2;
-		g_submitUs[3] += sb4 - sb3;
 	}
 #endif
 
