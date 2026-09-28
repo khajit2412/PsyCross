@@ -1184,6 +1184,7 @@ extern "C" void (*g_PsyX_PostCaptureHook)(void) = NULL;
 extern "C" unsigned long long g_splitUs[4];
 extern "C" unsigned long long g_submitUs[4];
 extern "C" unsigned long long g_vitaBeamTris[2];
+extern "C" void GR_VitaShadowStatReport(double frames);
 extern "C" unsigned long long g_vitaProfUs[4];
 extern "C" unsigned long long g_vitaProfUnlit[4];
 extern "C" unsigned g_vitaProfCnt[8];
@@ -1315,6 +1316,7 @@ void PsyX_EndScene()
 			memset(g_vitaPalCacheStats, 0, sizeof(g_vitaPalCacheStats));
 		}
 		VGLR_Report(n);
+		GR_VitaShadowStatReport(n);
 		if (s_drainN)
 			eprintf("[GPUDRAIN] %u samples: gpu backlog avg=%.2f max=%.2f ms, swap after drain avg=%.2f ms\n",
 			        s_drainN, s_drainUs / (double)s_drainN / 1000.0, s_drainMaxUs / 1000.0,
@@ -1345,11 +1347,8 @@ void PsyX_EndScene()
 			eprintf("[WORLDPROF] ms/frame: lit=%.2f unlit=%.2f chained=%.2f; per frame: gteOps=%.0f vsStores=%.0f shadowCopies=%.0f pgxpStores=%.0f\n",
 			        g_vitaProfUs[0] / n / 1000.0, g_vitaProfUs[1] / n / 1000.0, g_vitaProfUs[2] / n / 1000.0,
 			        g_vitaProfCnt[0] / n, g_vitaProfCnt[1] / n, g_vitaProfCnt[2] / n, g_vitaProfCnt[3] / n);
-			eprintf("[WORLDPROF] unlit split ms/frame: load=%.2f lighting=%.2f project=%.2f primbuild=%.2f; gte per frame: rtps=%.0f rtpt=%.0f other=%.0f\n",
-			        g_vitaProfUnlit[0] / n / 1000.0, g_vitaProfUnlit[3] / n / 1000.0,
-			        (g_vitaProfUnlit[1] - g_vitaProfUnlit[3]) / n / 1000.0, g_vitaProfUnlit[2] / n / 1000.0,
+			eprintf("[WORLDPROF] gte per frame: rtps=%.0f rtpt=%.0f other=%.0f\n",
 			        g_vitaProfCnt[4] / n, g_vitaProfCnt[5] / n, g_vitaProfCnt[6] / n);
-			memset(g_vitaProfUnlit, 0, sizeof(g_vitaProfUnlit));
 			memset(g_vitaProfUs, 0, sizeof(g_vitaProfUs));
 			memset(g_vitaProfCnt, 0, sizeof(g_vitaProfCnt));
 			eprintf("[SPLITCAUSE] per frame: blend=%.1f format=%.1f texture=%.1f depth=%.1f primMode=%.1f clip=%.1f dfe=%.1f other=%.1f\n",

@@ -357,8 +357,13 @@ void GR_ApplyRenderScale(void)
  * a desktop window resize, applied between frames. */
 extern "C" void Pc_VitaResolutionChanged(int w, int h);
 void GR_ResetDevice();
+static void GR_VitaShadowRelink(void);
 extern "C" void Vita_ApplySurfaceSize(int w, int h)
 {
+	/* vitaGL rebuilds its buffers on a resolution change, the shadow FBO's
+	 * depth buffer included: the texture aliasing it would keep reading the
+	 * old one (no shadows at all after the first dynamic-resolution switch). */
+	GR_VitaShadowRelink();
 	g_surfaceWidth  = w;
 	g_surfaceHeight = h;
 	GR_ApplyRenderScale();
@@ -2156,6 +2161,7 @@ struct LitShaderSet { GTEShader s4, s8, s16, s32, s32o; int built; };
 static LitShaderSet s_litSets[4];
 static int s_compileLitVariant = -1;
 static int s_litNoHalf = 0;
+static int s_compileShadowZPass = 0;
 static int s_shaderCompileFailed = 0;
 
 /* Shadow map as the pass's real depth buffer (vglTexImageDepthBuffer, DF32M)
@@ -2165,6 +2171,26 @@ static GLuint s_shadowZTex = 0;
 static int    s_shadowZAliased = 0;
 static int    s_shadowZStored = 0;	/* a pass has run since: the alias turned depth stores on */
 extern "C" const char* Pc_ModConfig_Value(const char* key);
+/* Receiver-plane depth slope per shadowed pixel (derivatives, a determinant,
+ * two divides). Without it lit surfaces self-shadow in flickering blocks, so it
+ * stays on; config vita_shadow_slope = 0 drops it for speed. */
+static int GR_VitaShadowSlope(void)
+{
+	static int mode = -1;
+	if (mode < 0)
+	{
+		const char* v = Pc_ModConfig_Value("vita_shadow_slope");
+		mode = (v && v[0] == '0') ? 0 : 1;
+	}
+	return mode;
+}
+
+/* Shadow map resolution (PC options Shadow_Quality, config vita_shadow_quality):
+ * 256 = Normal (default), 512 = Fine, 128 = Soft. The PCF keeps a one-texel
+ * step; spreading taps over a finer map instead skipped texels and broke edges. */
+extern "C" { int g_vitaShadowQuality = 256; }
+static int  s_mapValid;
+
 static int GR_VitaShadowZMode(void)
 {
 	static int mode = -1;
@@ -2640,6 +2666,11 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"		float shadowInvZ = (a_viewpos.z > 0.0) ? (1.0 / a_viewpos.z) : 0.0;\n"\
 	"		float shadowClipW = (u_pgxpEnabled > 0 && a_pgxp.z > 0.0) ? ((u_pgxpFarW > 0.0) ? min(a_pgxp.z, u_pgxpFarW) : a_pgxp.z) : 1.0;\n"\
 	"		v_shadowViewPos = vec4(a_viewpos * shadowInvZ, shadowInvZ) * shadowClipW;\n"\
+	/* Light clip position is linear in v_shadowViewPos, so it interpolates
+	 * exactly and the per-pixel mat4 goes away (Vita shadow variants). */\
+	"#ifdef PSYX_SHADOW_VS\n"\
+	"		v_lightClip = u_shadowMatrix * v_shadowViewPos;\n"\
+	"#endif\n"\
 	"	}\n"
 
 /* Vita draw batching (DrawAllSplits): an untextured prim merged into a VRAM
@@ -2747,9 +2778,12 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
  * was tried and gave no measurable speedup, only hard pixel-stepped edges. */
 #if defined(PSYX_VITA)
 #	define GPU_SHADOW_BEAM_GATE "cone * atten > 0.0"
+#	define GPU_SHADOW_FACING_GATE "\n#ifdef PSYX_SHADOW_FACING\n && ndl > 0.1501\n#endif\n"
 /* Shadow distance: no lookup where the beam is dim (far down a corridor the
  * whole screen was otherwise in range), faded in over the next band. */
-#	define GPU_SHADOW_RANGE_GATE " && d < 0.65 * u_flRange"
+/* Modern's N.L floor is 0.15: a surface facing away from the light only gets
+ * that fill, where a shadow is barely visible, so it skips the lookup. */
+#	define GPU_SHADOW_RANGE_GATE " && d < 0.65 * u_flRange" GPU_SHADOW_FACING_GATE
 #	define GPU_SHADOW_RANGE_FADE "							shadow = mix(float(shadow), 1.0, smoothstep(0.5 * u_flRange, 0.65 * u_flRange, d));\n"
 #else
 #	define GPU_SHADOW_BEAM_GATE "true"
@@ -2917,12 +2951,20 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"#ifndef PSYX_NO_SHADOW\n"\
 	"				if (u_shadowOn > 0 && " GPU_SHADOW_BEAM_GATE GPU_SHADOW_RANGE_GATE ") {\n"\
 	/* Perspective-correct shadow receiver (PR#8): correctness for BOTH styles -- same shadow shapes, just stable under motion. */\
+	"#ifdef PSYX_SHADOW_VS\n"\
+	"					vec4 lp = v_lightClip;\n"\
+	"#else\n"\
 	"					vec3 flShadowP = v_shadowViewPos.xyz / max(v_shadowViewPos.w, 1e-9);\n"\
 	"					vec3 flPs = flShadowP + L * (u_shadowNormalOffset * d);\n"\
 	"					vec4 lp = u_shadowMatrix * vec4(flPs, 1.0);\n"\
+	"#endif\n"\
 	"					if (lp.w > 0.0) {\n"\
 	"						vec3 luv = lp.xyz / lp.w * 0.5 + 0.5;\n"\
 	"						if (luv.x > 0.0 && luv.x < 1.0 && luv.y > 0.0 && luv.y < 1.0 && luv.z < 1.0) {\n"\
+	"#ifdef PSYX_NO_SLOPE\n"\
+	"							const float dzdu = 0.0;\n"\
+	"							const float dzdv = 0.0;\n"\
+	"#else\n"\
 	"							vec3 luvDx = dFdx(luv);\n"\
 	"							vec3 luvDy = dFdy(luv);\n"\
 	"							float det = luvDx.x * luvDy.y - luvDx.y * luvDy.x;\n"\
@@ -2932,6 +2974,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"								dzdu = (luvDx.z * luvDy.y - luvDy.z * luvDx.y) / det;\n"\
 	"								dzdv = (luvDy.z * luvDx.x - luvDx.z * luvDy.x) / det;\n"\
 	"							}\n"\
+	"#endif\n"\
 	GPU_SHADOW_FILTER\
 	"						}\n"\
 	"					}\n"\
@@ -3055,6 +3098,12 @@ const char* gte_shader_4 =
 	"varying float v_fade;\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
+	"#ifdef PSYX_SHADOW_VS\n"
+	"varying vec4 v_lightClip;\n"
+	"#ifdef VERTEX\n"
+	"uniform mat4 u_shadowMatrix;\n"
+	"#endif\n"
+	"#endif\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
 	"#else\n"
@@ -3070,6 +3119,12 @@ const char* gte_shader_8 =
 	"varying float v_fade;\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
+	"#ifdef PSYX_SHADOW_VS\n"
+	"varying vec4 v_lightClip;\n"
+	"#ifdef VERTEX\n"
+	"uniform mat4 u_shadowMatrix;\n"
+	"#endif\n"
+	"#endif\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
 	"#else\n"
@@ -3085,6 +3140,12 @@ const char* gte_shader_16 =
 	"varying float v_fade;\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
+	"#ifdef PSYX_SHADOW_VS\n"
+	"varying vec4 v_lightClip;\n"
+	"#ifdef VERTEX\n"
+	"uniform mat4 u_shadowMatrix;\n"
+	"#endif\n"
+	"#endif\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
 	"#else\n"
@@ -3100,6 +3161,12 @@ const char* gte_shader_32_rgba =
 	"varying float v_fade;\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
+	"#ifdef PSYX_SHADOW_VS\n"
+	"varying vec4 v_lightClip;\n"
+	"#ifdef VERTEX\n"
+	"uniform mat4 u_shadowMatrix;\n"
+	"#endif\n"
+	"#endif\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
 	"#else\n"
@@ -3407,13 +3474,30 @@ ShaderID GR_Shader_Compile(const char* source)
 		strcat(extra_fs_defines, "#define PSYX_NO_FLASHLIGHT\n");
 	if (s_compileOpaque)
 		strcat(extra_fs_defines, "#define PSYX_OPAQUE_TEX\n");
+	if (s_compileShadowZPass)
+		strcat(extra_fs_defines, "#define PSYX_SHADOW_ZPASS\n");
 	if (s_compileLitVariant >= 0)
 	{
 		strcat(extra_fs_defines, (s_compileLitVariant & 2) ? "#define FL_CLASSIC true\n" : "#define FL_CLASSIC false\n");
 		if (!(s_compileLitVariant & 1))
 			strcat(extra_fs_defines, "#define PSYX_NO_SHADOW\n");
-		else if (GR_VitaShadowZMode())
-			strcat(extra_fs_defines, "#define PSYX_SHADOW_ZTEX\n");
+		else
+		{
+			/* PSYX_SHADOW_VS (light clip position from the vertex shader) is left
+			 * off: together with the receiver-plane slope term the shader found
+			 * nothing in shadow at all. Per-pixel is the known-good combination. */
+			if (GR_VitaShadowZMode())
+				strcat(extra_fs_defines, "#define PSYX_SHADOW_ZTEX\n");
+			if (!GR_VitaShadowSlope())
+				strcat(extra_fs_defines, "#define PSYX_NO_SLOPE\n");
+			{
+				/* Skip the lookup on surfaces facing away (Modern N.L floor):
+				 * off by default while shadows are being verified. */
+				const char* v = Pc_ModConfig_Value("vita_shadow_facing");
+				if (v && v[0] == '1')
+					strcat(extra_fs_defines, "#define PSYX_SHADOW_FACING\n");
+			}
+		}
 		if (!s_litNoHalf)
 			strcat(extra_fs_defines, "#define PSYX_LIT_HALF\n");
 	}
@@ -4824,6 +4908,7 @@ TextureID GR_VitaPaletteTexture(int key, int* opaque)
 	return s_palc[idx].tex;
 }
 
+
 /* Binds a cached palette texture through the RGBA override path. */
 void GR_VitaSetPaletteTexture(TextureID tex, int noDiscard)
 {
@@ -6153,12 +6238,16 @@ static const char* s_shadowDepthShaderSrc =
 	"}\n"
 	"#else\n"
 	"void main() {\n"
+	"#ifdef PSYX_SHADOW_ZPASS\n"
+	"	gl_FragColor = vec4(1.0);\n"
+	"#else\n"
 	"	float d = v_shadowZW.x / v_shadowZW.y * 0.5 + 0.5;\n"
 	"	d += 1.5 * max(abs(dFdx(d)), abs(dFdy(d))) + 1.0 / 16777216.0;\n"
 	"	d = clamp(d, 0.0, 0.999999);\n"
 	"	vec4 enc = fract(d * vec4(1.0, 255.0, 65025.0, 16581375.0));\n"
 	"	enc -= enc.yzww * vec4(1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0, 0.0);\n"
 	"	gl_FragColor = enc;\n"
+	"#endif\n"
 	"}\n"
 	"#endif\n";
 #else
@@ -6235,7 +6324,10 @@ static void GR_EnsureShadowTarget(void)
 	 * absurd. 8192 is above ES 3.0's guaranteed minimum (4096), so sizes past
 	 * that are additionally capped to the driver's real limit -- a GPU that
 	 * can't do it gets the biggest map it can instead of an incomplete FBO. */
-	if (g_PsyX_ShadowMapSize < 256)   g_PsyX_ShadowMapSize = 256;
+#if defined(PSYX_VITA)
+	g_PsyX_ShadowMapSize = (g_vitaShadowQuality == 128 || g_vitaShadowQuality == 512) ? g_vitaShadowQuality : 256;
+#endif
+	if (g_PsyX_ShadowMapSize < 128)   g_PsyX_ShadowMapSize = 128;
 	if (g_PsyX_ShadowMapSize > 8192)  g_PsyX_ShadowMapSize = 8192;
 	if (g_PsyX_ShadowMapSize > 4096)
 	{
@@ -6260,6 +6352,10 @@ static void GR_EnsureShadowTarget(void)
 #if defined(PSYX_VITA)
 		glDeleteRenderbuffers(1, &g_shadowDepthRbo);
 		g_shadowDepthRbo = 0;
+		/* The depth alias pointed into the old FBO: redo it after the next pass. */
+		s_shadowZAliased = 0;
+		s_shadowZStored  = 0;
+		s_mapValid       = 0;
 #endif
 	}
 
@@ -6372,7 +6468,15 @@ static void GR_EnsureShadowTarget(void)
 
 	if (g_shadowDepthShader == (ShaderID)-1)
 	{
+#if defined(PSYX_VITA)
+		/* Depth-texture mode samples the pass's depth buffer: its colour
+		 * output is unused, so the packing shader becomes a constant. */
+		s_compileShadowZPass = GR_VitaShadowZMode();
+#endif
 		g_shadowDepthShader = GR_Shader_Compile(s_shadowDepthShaderSrc);
+#if defined(PSYX_VITA)
+		s_compileShadowZPass = 0;
+#endif
 		g_shadowDepthMatrixLoc = glGetUniformLocation(g_shadowDepthShader, "u_shadowMatrix");
 	}
 }
@@ -6442,6 +6546,7 @@ static void GR_VitaSteadyShadowLight(float eye[3], float dir[3])
 static void GR_BuildShadowMatrix(void)
 {
 	float sizeActive = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightSizeFps : g_PsyX_FlashlightSize;
+
 	float flOuter = 1.0f - sizeActive * (1.0f - g_PsyX_FlashlightOuterCos);
 	if (flOuter < 0.05f)  flOuter = 0.05f;
 	if (flOuter > 0.999f) flOuter = 0.999f;
@@ -6507,21 +6612,43 @@ static GLint s_shadowPrevViewport[4] = { 0, 0, 0, 0 };
 #if defined(PSYX_VITA)
 static float    s_mapMatrix[16];
 static unsigned s_mapCasterHash = 0;
-static int      s_mapValid = 0;
+
 
 /* Builds this flush's light matrix. Returns 1 when the map already holds
  * exactly these casters from this light, so the pass can be skipped. */
+static void GR_VitaShadowRelink(void)
+{
+	s_shadowZAliased = 0;
+	s_shadowZStored  = 0;
+	s_mapValid       = 0;
+}
+
+/* [SHADOWSTAT]: passes drawn / reused / kept, caster triangles, and the
+ * depth-texture link state, per report window. */
+extern "C" { unsigned g_vitaShadowStat[6]; }
+extern "C" void GR_VitaShadowStatReport(double frames)
+{
+	eprintf("[SHADOWSTAT] per frame: passes=%.2f reused=%.2f kept=%.2f casterTris=%.0f; map=%d ztex=%d aliased=%d stored=%d slope=%d\n",
+	        g_vitaShadowStat[0] / frames, g_vitaShadowStat[1] / frames, g_vitaShadowStat[2] / frames,
+	        g_vitaShadowStat[3] / frames, (int)s_shadowTexSize, GR_VitaShadowZMode(), s_shadowZAliased,
+	        s_shadowZStored, GR_VitaShadowSlope());
+	memset(g_vitaShadowStat, 0, sizeof(g_vitaShadowStat));
+}
+
 int GR_ShadowMapCurrent(unsigned casterHash)
 {
 	GR_BuildShadowMatrix();
-	return s_mapValid && g_shadowFBO != 0 && casterHash == s_mapCasterHash &&
-	       memcmp(s_mapMatrix, g_shadowLightMatrix, sizeof(s_mapMatrix)) == 0;
+	const int cur = s_mapValid && g_shadowFBO != 0 && casterHash == s_mapCasterHash &&
+	                memcmp(s_mapMatrix, g_shadowLightMatrix, sizeof(s_mapMatrix)) == 0;
+	g_vitaShadowStat[cur ? 1 : 0]++;
+	return cur;
 }
 
 /* A flush with no casters draws no pass: its receivers read the map that is
  * there, so they must use the light it was rendered from. */
 void GR_ShadowMapKeep(void)
 {
+	g_vitaShadowStat[2]++;
 	if (s_mapValid)
 		memcpy(g_shadowLightMatrix, s_mapMatrix, sizeof(s_mapMatrix));
 }
@@ -6567,6 +6694,13 @@ void GR_ShadowPassBegin(void)
 #endif
 
 	glEnable(GL_POLYGON_OFFSET_FILL);
+#if defined(PSYX_VITA)
+	/* Without the receiver-plane slope term the pass carries the slope bias
+	 * (vitaGL truncates both terms to integers). */
+	if (!GR_VitaShadowSlope())
+		glPolygonOffset(2.0f, 4.0f);
+	else
+#endif
 	glPolygonOffset(1.5f, 1.0f);
 
 	glUseProgram(g_shadowDepthShader);
@@ -6576,6 +6710,9 @@ void GR_ShadowPassBegin(void)
 
 void GR_ShadowPassDraw(int startVertex, int numVerts)
 {
+#if defined(PSYX_VITA)
+	g_vitaShadowStat[3] += (unsigned)(numVerts / 3);
+#endif
 	glDrawArrays(GL_TRIANGLES, startVertex, numVerts);
 }
 

@@ -111,7 +111,25 @@ static inline unsigned ShadowHash(uintptr_t k) {
 #if defined(__vita__)
 static_assert(sizeof(ShadowEntry) == 64, "one cache line per entry");
 
+/* GTE results are stored to the scratchpad and copied from there into prims,
+ * so most shadow traffic is keyed inside this 4 KB block: it gets its own
+ * direct-mapped entries (64 KB, stays in cache) instead of the hash table,
+ * the way the original PsyCross PGXP kept its cache linear. */
+extern "C" uint8_t g_PsxScratchpad[4096];
+static ShadowEntry s_scratchShadow[4096 / 4] __attribute__((aligned(64)));
+
+static inline ShadowEntry* Sh_Scratch(uintptr_t k) {
+	const uintptr_t off = k - (uintptr_t)g_PsxScratchpad;
+	return (off < sizeof(g_PsxScratchpad)) ? &s_scratchShadow[off >> 2] : nullptr;
+}
+
 static ShadowEntry* Sh_Slot(uintptr_t k) {
+	if (ShadowEntry* d = Sh_Scratch(k)) {
+		if (d->key != k || d->gen != s_pgxpGen) {
+			d->key = k; d->gen = s_pgxpGen; d->hasP = 0; d->hasV = 0;
+		}
+		return d;
+	}
 	if (s_shadow == nullptr)
 	{
 		s_shadow = (ShadowEntry*)memalign(64, SHADOW_SIZE * sizeof(ShadowEntry));
@@ -134,6 +152,8 @@ static ShadowEntry* Sh_Slot(uintptr_t k) {
 }
 
 static const ShadowEntry* Sh_Find(uintptr_t k) {
+	if (const ShadowEntry* d = Sh_Scratch(k))
+		return (d->key == k && d->gen == s_pgxpGen) ? d : nullptr;
 	if (s_shadow == nullptr)
 		return nullptr;
 	const unsigned s = ShadowHash(k);
@@ -3171,6 +3191,7 @@ static GrVertex* s_drawVerts = g_vertexBuffer;
 #define VITA_BEAM_MAX_TRIS 16384
 static int s_beamOn = 0;
 static unsigned char s_beamClass[VITA_BEAM_MAX_TRIS];
+
 extern "C" { unsigned long long g_vitaBeamTris[2]; }
 #endif
 
@@ -3281,6 +3302,7 @@ void DrawSplit(const GPUDrawSplit& split)
 	}
 	else if (s_beamOn)
 		g_vitaBeamTris[0] += nTris;
+
 #endif
 
 	unsigned long long t2 = SPLIT_T();
