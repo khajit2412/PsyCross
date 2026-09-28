@@ -2203,6 +2203,7 @@ float g_vitaShadowSoftK = 80.0f;
 float g_vitaShadowSoftBlur = 1.0f;
 }
 static int s_compileShadowEsm = 0;
+static unsigned s_uniGen = 1;	/* GR_VitaUniformsCurrent cache generation */
 
 static int GR_VitaShadowSoft(void)
 {
@@ -3329,6 +3330,9 @@ int GR_Shader_CheckProgramStatus(GLuint program)
 
 ShaderID GR_Shader_Compile(const char* source)
 {
+#if defined(PSYX_VITA)
+	s_uniGen++;
+#endif
 #if defined(ES2_SHADERS)
 	const char* GLSL_HEADER_VERT =
 		"#version 100\n"
@@ -4231,6 +4235,66 @@ void GR_SetShader(const ShaderID shader)
 }
 
 
+#if defined(PSYX_VITA)
+/* Every draw re-bound its program's ~30 fog / flashlight / shadow / filter
+ * uniforms although they change once a frame at most: ~7500 calls a frame
+ * through the recorder. The inputs are compared per program instead and the
+ * block is skipped when they match what that program was last given. Any
+ * shader compile can reuse a program name, so it empties the cache. */
+struct GR_VitaUniSig
+{
+	ShaderID prog;
+	int   pgxp, voidProbe, fogToBlack, flOn, untex, flStyle, fpsMode, shadowOn, soft, mapSize;
+	int   dither, winW, ditherSup, menuFilter, texFormat, texFilter, aniso;
+	float szMax, farBias, farW, fogStr, flDim;
+	float fog[3], o[3], d[3], col[3];
+	float intens, intensFps, size, sizeFps, innerCos, outerCos, range;
+	float shM[16], bias, nOff, strength, zn, zf, fade, k;
+};
+static GR_VitaUniSig s_uniSig[64];
+static unsigned      s_uniSigGen[64];
+
+static int GR_VitaUniformsCurrent(ShaderID prog, TextureID texture, TexFormat texFormat, int shadowOn)
+{
+	extern float g_PgxpFarWClamp;
+	GR_VitaUniSig g;
+	memset(&g, 0, sizeof(g));
+	g.prog = prog;
+	g.pgxp = g_PsxUsePgxp; g.voidProbe = g_PsxVoidProbeArmed == 2; g.fogToBlack = g_PsxFogToBlack;
+	g.flOn = g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive;
+	g.untex = texture == g_whiteTexture; g.flStyle = g_PsyX_FlashlightStyle != 0;
+	g.fpsMode = g_PsyX_FlashlightFpsMode; g.shadowOn = shadowOn;
+	g.soft = GR_VitaShadowSoft(); g.mapSize = PSYX_SHADOW_MAP_SIZE;
+	g.dither = g_cfg_psxDither; g.winW = g_windowWidth; g.ditherSup = g_PsxDitherSuppressed;
+	g.menuFilter = g_cfg_menuFilter; g.texFormat = texFormat; g.texFilter = g_cfg_textureFilter;
+	g.aniso = g_cfg_anisoLevel;
+	g.szMax = PGXP_GetSzMax(); g.farBias = (float)g_PsxPgxpWorldFarBias; g.farW = g_PgxpFarWClamp;
+	g.fogStr = g_PsyX_FogStrength; g.flDim = g_vitaLeanDim;
+	memcpy(g.fog, g_PsyX_FogColor, sizeof(g.fog));
+	memcpy(g.o, s_beam.o, sizeof(g.o));
+	memcpy(g.d, s_beam.d, sizeof(g.d));
+	memcpy(g.col, g_PsyX_FlashlightColor, sizeof(g.col));
+	g.intens = g_PsyX_FlashlightIntensity; g.intensFps = g_PsyX_FlashlightIntensityFps;
+	g.size = g_PsyX_FlashlightSize; g.sizeFps = g_PsyX_FlashlightSizeFps;
+	g.innerCos = g_PsyX_FlashlightInnerCos; g.outerCos = g_PsyX_FlashlightOuterCos;
+	g.range = g_PsyX_FlashlightRange;
+	if (shadowOn)
+	{
+		memcpy(g.shM, g_shadowLightMatrix, sizeof(g.shM));
+		g.bias = g_PsyX_FlashlightShadowBias; g.nOff = g_PsyX_FlashlightShadowNormalOffset;
+		g.strength = g_PsyX_FlashlightShadowStrength; g.zn = g_shadowZNear; g.zf = g_shadowZFar;
+		g.fade = g_PsyX_FlashlightShadowFadeDist; g.k = GR_VitaShadowSoftK();
+	}
+
+	const unsigned slot = (unsigned)prog & 63u;
+	if (s_uniSigGen[slot] == s_uniGen && memcmp(&s_uniSig[slot], &g, sizeof(g)) == 0)
+		return 1;
+	s_uniSig[slot] = g;
+	s_uniSigGen[slot] = s_uniGen;
+	return 0;
+}
+#endif
+
 static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShader* shader)
 {
 	switch (texFormat)
@@ -4402,6 +4466,18 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		break;
 	}
 
+#if defined(PSYX_VITA)
+	int shadowOnV = (g_PsyX_UseFlashlightShadows && g_PsyX_UsePerPixelFlashlight &&
+	                 g_PsyX_FlashlightActive && g_shadowDepthTex != 0 &&
+	                 !g_PsxPresentLastFrame) ? 1 : 0;
+	if (GR_VitaShadowZMode() && !s_shadowZStored)
+		shadowOnV = 0;
+	if (u_blendSrcLoc != -1)
+		glUniform2fv(u_blendSrcLoc, 1, g_PsxBlendSrc);
+	const int uniSkip = GR_VitaUniformsCurrent(shader->shader, texture, texFormat, shadowOnV);
+	if (!uniSkip)
+	{
+#endif
 	/* Push u_pgxpEnabled every shader bind so vertex shader's v_is3d
 	 * fallback ((u_pgxpEnabled > 0) ? a_zw.y test : 1.0) correctly
 	 * drops the 3D-only gate when PGXP is off at runtime. Without
@@ -4430,8 +4506,10 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 
 	if (u_fogToBlackLoc != -1)
 		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
+#if !defined(PSYX_VITA)
 	if (u_blendSrcLoc != -1)
 		glUniform2fv(u_blendSrcLoc, 1, g_PsxBlendSrc);
+#endif
 
 	if (u_fogStrengthLoc != -1)
 		glUniform1f(u_fogStrengthLoc, g_PsyX_FogStrength);
@@ -4594,15 +4672,23 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 #endif
 				glUniform2f(u_shadowTexelLoc, 1.0f / (float)PSYX_SHADOW_MAP_SIZE, 1.0f / (float)PSYX_SHADOW_MAP_SIZE);
 			}
+#if !defined(PSYX_VITA)
 			glActiveTexture(GL_TEXTURE1);
-#if defined(PSYX_VITA)
-			glBindTexture(GL_TEXTURE_2D, GR_VitaShadowZMode() ? s_shadowZTex : g_shadowDepthTex);
-#else
 			glBindTexture(GL_TEXTURE_2D, g_shadowDepthTex);
-#endif
 			glActiveTexture(GL_TEXTURE0);
+#endif
 		}
 	}
+#if defined(PSYX_VITA)
+	}
+	/* Texture units are context state, not program state: rebind every time. */
+	if (shadowOnV)
+	{
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, GR_VitaShadowZMode() ? s_shadowZTex : g_shadowDepthTex);
+		glActiveTexture(GL_TEXTURE0);
+	}
+#endif
 
 	/* Re-assert the decode table on unit 2, like the shadow map above: the
 	 * upload in GR_GenerateCommonTextures is a one-shot, and a pass that ever
@@ -4613,6 +4699,10 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	glBindTexture(GL_TEXTURE_2D, g_rgLutTexture);
 	glActiveTexture(GL_TEXTURE0);
 
+#if defined(PSYX_VITA)
+	if (!uniSkip)
+	{
+#endif
 	/* Push the dither-force uniform every shader bind. Cheap (single
 	 * float upload) and ensures runtime config changes (if we add a
 	 * hotkey toggle later) take effect on the next primitive.
@@ -4681,6 +4771,9 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 
 		glUniform1f(u_anisoTapsLoc, taps);
 	}
+#if defined(PSYX_VITA)
+	}
+#endif
 
 	if (g_dbg_texturelessMode) {
 		texture = g_whiteTexture;
