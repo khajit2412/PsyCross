@@ -2158,7 +2158,7 @@ static int s_compileOpaque = 0;
  * occupancy of the heaviest one. Each style/shadow pairing is its own program,
  * built the first time it is selected. Index: classic * 2 + shadows. */
 struct LitShaderSet { GTEShader s4, s8, s16, s32, s32o; int built; };
-static LitShaderSet s_litSets[4];
+static LitShaderSet s_litSets[8];
 static int s_compileLitVariant = -1;
 static int s_litNoHalf = 0;
 static int s_compileShadowZPass = 0;
@@ -2191,6 +2191,31 @@ static int GR_VitaShadowSlope(void)
 extern "C" { int g_vitaShadowQuality = 256; }
 static int  s_mapValid;
 
+/* Soft shadows (PC options Soft_Shadows, config vita_shadow_soft, default on):
+ * an exponential shadow map. The pass stores linear light depth in a
+ * half-float map, which is blurred in log space and read with one
+ * hardware-bilinear fetch, so edges come out smooth at any map size instead
+ * of stepping along the texels. Off = the depth-compare PCF. Soft_Sharpness
+ * is the exponent K, Soft_Blur the blur step in texels; all three apply live. */
+extern "C" {
+int   g_vitaShadowSoft = 1;
+float g_vitaShadowSoftK = 80.0f;
+float g_vitaShadowSoftBlur = 1.0f;
+}
+static int s_compileShadowEsm = 0;
+
+static int GR_VitaShadowSoft(void)
+{
+	return g_vitaShadowSoft != 0;
+}
+
+/* exp(K) must stay inside fp32 in the blur (e^88 overflows). */
+static float GR_VitaShadowSoftK(void)
+{
+	const float k = g_vitaShadowSoftK;
+	return (k < 5.0f) ? 5.0f : ((k > 80.0f) ? 80.0f : k);
+}
+
 static int GR_VitaShadowZMode(void)
 {
 	static int mode = -1;
@@ -2199,7 +2224,7 @@ static int GR_VitaShadowZMode(void)
 		const char* v = Pc_ModConfig_Value("vita_shadow_depth_texture");
 		mode = (v && v[0] == '0') ? 0 : 1;
 	}
-	return mode;
+	return mode && !GR_VitaShadowSoft();
 }
 #endif
 
@@ -2258,6 +2283,17 @@ static GLuint g_shadowFBO = 0;
 static GLuint g_shadowDepthTex = 0;
 #if defined(PSYX_VITA)
 static GLuint g_shadowDepthRbo = 0;
+static GLuint s_shadowBlurFBO = 0;
+static GLuint s_shadowBlurTex = 0;
+static GLuint s_shadowBlurVAO = 0;
+static ShaderID s_shadowBlurShader = (ShaderID)-1;
+static GLint s_shadowBlurStepLoc = -1;
+static GLint s_shadowBlurKLoc = -1;
+static GLint g_shadowDepthLinLoc = -1;
+static int   s_shadowTexSoft = 0;
+static ShaderID s_depthShaderV[2] = { (ShaderID)-1, (ShaderID)-1 };
+static GLint s_depthMatLocV[2] = { -1, -1 };
+static GLint s_depthLinLocV[2] = { -1, -1 };
 #endif
 static ShaderID g_shadowDepthShader = (ShaderID)-1;
 static GLint g_shadowDepthMatrixLoc = -1;
@@ -2895,6 +2931,26 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"							shadow = 1.0 - u_shadowStrength * (occ / " GPU_SHADOW_PCF_DIV ");\n"
 #endif
 
+/* Soft shadows (GR_VitaShadowSoft): exponential shadow map test on the
+ * blurred linear depth. u_shadowClip carries (near, 1 / (far - near)) and
+ * u_shadowTexel.x the exponent K here. */
+#if defined(PSYX_VITA)
+#	define GPU_SHADOW_ESM_LOOKUP\
+	"#ifdef PSYX_SHADOW_ESM\n"\
+	"						vec2 luv = lp.xy / lp.w * 0.5 + 0.5;\n"\
+	"						float zr = (lp.w - u_shadowClip.x) * u_shadowClip.y;\n"\
+	"						if (luv.x > 0.0 && luv.x < 1.0 && luv.y > 0.0 && luv.y < 1.0 && zr < 1.0) {\n"\
+	"							float vis = exp(min(0.0, u_shadowTexel.x * (texture2D(u_shadowTex, luv).r - zr + u_shadowBias)));\n"\
+	"							shadow = 1.0 - u_shadowStrength * (1.0 - vis);\n"\
+	GPU_SHADOW_RANGE_FADE\
+	"						}\n"\
+	"#else\n"
+#	define GPU_SHADOW_ESM_END "#endif\n"
+#else
+#	define GPU_SHADOW_ESM_LOOKUP ""
+#	define GPU_SHADOW_ESM_END ""
+#endif
+
 #define GPU_LIT_TAIL\
 	"		vec3 flAlbedo = fragColor.rgb;\n"\
 	"		fragColor *= v_color;\n"\
@@ -2959,6 +3015,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"					vec4 lp = u_shadowMatrix * vec4(flPs, 1.0);\n"\
 	"#endif\n"\
 	"					if (lp.w > 0.0) {\n"\
+	GPU_SHADOW_ESM_LOOKUP\
 	"						vec3 luv = lp.xyz / lp.w * 0.5 + 0.5;\n"\
 	"						if (luv.x > 0.0 && luv.x < 1.0 && luv.y > 0.0 && luv.y < 1.0 && luv.z < 1.0) {\n"\
 	"#ifdef PSYX_NO_SLOPE\n"\
@@ -2977,6 +3034,7 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"#endif\n"\
 	GPU_SHADOW_FILTER\
 	"						}\n"\
+	GPU_SHADOW_ESM_END\
 	"					}\n"\
 	"				}\n"\
 	"#endif\n"\
@@ -3481,6 +3539,8 @@ ShaderID GR_Shader_Compile(const char* source)
 		strcat(extra_fs_defines, (s_compileLitVariant & 2) ? "#define FL_CLASSIC true\n" : "#define FL_CLASSIC false\n");
 		if (!(s_compileLitVariant & 1))
 			strcat(extra_fs_defines, "#define PSYX_NO_SHADOW\n");
+		else if (s_compileLitVariant & 4)
+			strcat(extra_fs_defines, "#define PSYX_SHADOW_ESM\n");
 		else
 		{
 			/* PSYX_SHADOW_VS (light clip position from the vertex shader) is left
@@ -3501,6 +3561,8 @@ ShaderID GR_Shader_Compile(const char* source)
 		if (!s_litNoHalf)
 			strcat(extra_fs_defines, "#define PSYX_LIT_HALF\n");
 	}
+	if (s_compileShadowEsm)
+		strcat(extra_fs_defines, "#define PSYX_SHADOW_ESM\n");
 #endif
 #endif
 
@@ -3762,7 +3824,8 @@ extern "C" ShaderID Pc_ModernShader_Get(TexFormat);
 #if defined(PSYX_VITA)
 static LitShaderSet* GR_VitaLitSet(void)
 {
-	const int idx = (g_PsyX_FlashlightStyle ? 2 : 0) | (g_PsyX_UseFlashlightShadows ? 1 : 0);
+	const int idx = (g_PsyX_FlashlightStyle ? 2 : 0) | (g_PsyX_UseFlashlightShadows ? 1 : 0) |
+	                ((g_PsyX_UseFlashlightShadows && GR_VitaShadowSoft()) ? 4 : 0);
 	LitShaderSet* set = &s_litSets[idx];
 
 	while (!set->built)
@@ -3786,7 +3849,7 @@ static LitShaderSet* GR_VitaLitSet(void)
 		}
 		set->built = 1;
 		g_PreviousShader = (ShaderID)-1;
-		eprintf("[LITSHADER] built style=%s shadows=%d half=%d\n", (idx & 2) ? "classic" : "modern", idx & 1, !s_litNoHalf);
+		eprintf("[LITSHADER] built style=%s shadows=%d soft=%d half=%d\n", (idx & 2) ? "classic" : "modern", idx & 1, (idx & 4) != 0, !s_litNoHalf);
 	}
 	return set;
 }
@@ -4512,11 +4575,25 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 			if (u_shadowStrengthLoc != -1)
 				glUniform1f(u_shadowStrengthLoc, g_PsyX_FlashlightShadowStrength);
 			if (u_shadowClipLoc != -1)
+			{
+#if defined(PSYX_VITA)
+				if (GR_VitaShadowSoft())
+					glUniform2f(u_shadowClipLoc, g_shadowZNear, 1.0f / (g_shadowZFar - g_shadowZNear));
+				else
+#endif
 				glUniform2f(u_shadowClipLoc, g_shadowZNear, g_shadowZFar);
+			}
 			if (u_shadowFadeDistLoc != -1)
 				glUniform1f(u_shadowFadeDistLoc, g_PsyX_FlashlightShadowFadeDist);
 			if (u_shadowTexelLoc != -1)
+			{
+#if defined(PSYX_VITA)
+				if (GR_VitaShadowSoft())
+					glUniform2f(u_shadowTexelLoc, GR_VitaShadowSoftK(), 0.0f);
+				else
+#endif
 				glUniform2f(u_shadowTexelLoc, 1.0f / (float)PSYX_SHADOW_MAP_SIZE, 1.0f / (float)PSYX_SHADOW_MAP_SIZE);
+			}
 			glActiveTexture(GL_TEXTURE1);
 #if defined(PSYX_VITA)
 			glBindTexture(GL_TEXTURE_2D, GR_VitaShadowZMode() ? s_shadowZTex : g_shadowDepthTex);
@@ -6237,9 +6314,15 @@ static const char* s_shadowDepthShaderSrc =
 	"	v_shadowZW = gl_Position.zw;\n"
 	"}\n"
 	"#else\n"
+	"#ifdef PSYX_SHADOW_ESM\n"
+	"uniform vec2 u_shadowLin;\n"
+	"#endif\n"
 	"void main() {\n"
 	"#ifdef PSYX_SHADOW_ZPASS\n"
 	"	gl_FragColor = vec4(1.0);\n"
+	"#else\n"
+	"#ifdef PSYX_SHADOW_ESM\n"
+	"	gl_FragColor = vec4(clamp((v_shadowZW.y - u_shadowLin.x) * u_shadowLin.y, 0.0, 1.0));\n"
 	"#else\n"
 	"	float d = v_shadowZW.x / v_shadowZW.y * 0.5 + 0.5;\n"
 	"	d += 1.5 * max(abs(dFdx(d)), abs(dFdy(d))) + 1.0 / 16777216.0;\n"
@@ -6248,6 +6331,29 @@ static const char* s_shadowDepthShaderSrc =
 	"	enc -= enc.yzww * vec4(1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0, 0.0);\n"
 	"	gl_FragColor = enc;\n"
 	"#endif\n"
+	"#endif\n"
+	"}\n"
+	"#endif\n";
+
+/* Separable 5-tap Gaussian over the soft-shadow map, averaged as exp(K z)
+ * (log-space ESM filtering) so the stored value stays a depth in [0, 1]. */
+static const char* s_shadowBlurShaderSrc =
+	"varying vec2 v_uv;\n"
+	"#ifdef VERTEX\n"
+	"attribute vec2 a_position;\n"
+	"void main() { v_uv = a_position * 0.5 + 0.5; gl_Position = vec4(a_position, 0.0, 1.0); }\n"
+	"#else\n"
+	"uniform sampler2D s_texture;\n"
+	"uniform vec2 u_step;\n"
+	"uniform float u_k;\n"
+	"void main() {\n"
+	"	float z0 = texture2D(s_texture, v_uv).r;\n"
+	"	float s = 0.375\n"
+	"		+ 0.25 * exp(u_k * (texture2D(s_texture, v_uv - u_step).r - z0))\n"
+	"		+ 0.25 * exp(u_k * (texture2D(s_texture, v_uv + u_step).r - z0))\n"
+	"		+ 0.0625 * exp(u_k * (texture2D(s_texture, v_uv - 2.0 * u_step).r - z0))\n"
+	"		+ 0.0625 * exp(u_k * (texture2D(s_texture, v_uv + 2.0 * u_step).r - z0));\n"
+	"	gl_FragColor = vec4(z0 + log(s) / u_k);\n"
 	"}\n"
 	"#endif\n";
 #else
@@ -6343,7 +6449,11 @@ static void GR_EnsureShadowTarget(void)
 	}
 
 	/* Resolution changed at runtime: drop the old target and build a new one. */
+#if defined(PSYX_VITA)
+	if (g_shadowFBO != 0 && (s_shadowTexSize != g_PsyX_ShadowMapSize || s_shadowTexSoft != GR_VitaShadowSoft()))
+#else
 	if (g_shadowFBO != 0 && s_shadowTexSize != g_PsyX_ShadowMapSize)
+#endif
 	{
 		glDeleteFramebuffers(1, &g_shadowFBO);
 		glDeleteTextures(1, &g_shadowDepthTex);
@@ -6352,6 +6462,13 @@ static void GR_EnsureShadowTarget(void)
 #if defined(PSYX_VITA)
 		glDeleteRenderbuffers(1, &g_shadowDepthRbo);
 		g_shadowDepthRbo = 0;
+		if (s_shadowBlurFBO != 0)
+		{
+			glDeleteFramebuffers(1, &s_shadowBlurFBO);
+			glDeleteTextures(1, &s_shadowBlurTex);
+			s_shadowBlurFBO = 0;
+			s_shadowBlurTex = 0;
+		}
 		/* The depth alias pointed into the old FBO: redo it after the next pass. */
 		s_shadowZAliased = 0;
 		s_shadowZStored  = 0;
@@ -6366,16 +6483,35 @@ static void GR_EnsureShadowTarget(void)
 
 #if defined(PSYX_VITA)
 	/* NEAREST is required, not a choice: filtering would blend the packed
-	 * bytes. The receiver's PCF does its own weighting. */
-	glGenTextures(1, &g_shadowDepthTex);
-	glBindTexture(GL_TEXTURE_2D, g_shadowDepthTex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE,
-	             0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	 * bytes. The receiver's PCF does its own weighting. The soft map holds a
+	 * plain half-float depth and is filtered. */
+	const int soft = GR_VitaShadowSoft();
+	s_shadowTexSoft = soft;
+	GLuint* texs[2] = { &g_shadowDepthTex, &s_shadowBlurTex };
+	for (int t = 0; t < (soft ? 2 : 1); t++)
+	{
+		glGenTextures(1, texs[t]);
+		glBindTexture(GL_TEXTURE_2D, *texs[t]);
+		if (soft)
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE,
+			             0, GL_RGBA, GL_HALF_FLOAT, NULL);
+		else
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE,
+			             0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, soft ? GL_LINEAR : GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, soft ? GL_LINEAR : GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	}
 	glBindTexture(GL_TEXTURE_2D, 0);
+	if (soft)
+	{
+		glGenFramebuffers(1, &s_shadowBlurFBO);
+		glBindFramebuffer(GL_FRAMEBUFFER, s_shadowBlurFBO);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_shadowBlurTex, 0);
+		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+			eprinterr("soft shadow blur FBO incomplete\n");
+	}
 
 	glGenRenderbuffers(1, &g_shadowDepthRbo);
 	glBindRenderbuffer(GL_RENDERBUFFER, g_shadowDepthRbo);
@@ -6457,7 +6593,8 @@ static void GR_EnsureShadowTarget(void)
 		else
 		{
 #if defined(PSYX_VITA)
-			eprintf("*shadow target ready: %dx%d rgba8-packed depth\n", PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE);
+			eprintf("*shadow target ready: %dx%d %s\n", PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE,
+			        GR_VitaShadowSoft() ? "half-float soft (ESM)" : "rgba8-packed depth");
 #else
 			eprintf("*shadow target ready: %dx%d depth24\n", PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE);
 #endif
@@ -6466,19 +6603,59 @@ static void GR_EnsureShadowTarget(void)
 
 	glBindFramebuffer(GL_FRAMEBUFFER, GR_ScreenFBO());
 
+#if defined(PSYX_VITA)
+	{
+		const int soft = GR_VitaShadowSoft();
+
+		if (s_depthShaderV[soft] == (ShaderID)-1)
+		{
+			/* Depth-texture mode samples the pass's depth buffer: its colour
+			 * output is unused, so the packing shader becomes a constant. */
+			s_compileShadowZPass = GR_VitaShadowZMode();
+			s_compileShadowEsm = soft;
+			s_depthShaderV[soft] = GR_Shader_Compile(s_shadowDepthShaderSrc);
+			s_compileShadowZPass = 0;
+			s_compileShadowEsm = 0;
+			s_depthMatLocV[soft] = glGetUniformLocation(s_depthShaderV[soft], "u_shadowMatrix");
+			s_depthLinLocV[soft] = glGetUniformLocation(s_depthShaderV[soft], "u_shadowLin");
+		}
+		g_shadowDepthShader    = s_depthShaderV[soft];
+		g_shadowDepthMatrixLoc = s_depthMatLocV[soft];
+		g_shadowDepthLinLoc    = s_depthLinLocV[soft];
+
+		if (soft && s_shadowBlurShader == (ShaderID)-1)
+		{
+			static const float quad[8] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f };
+			GLint prevBuf = 0;
+			GLuint vbo;
+
+			s_shadowBlurShader = GR_Shader_Compile(s_shadowBlurShaderSrc);
+			s_shadowBlurStepLoc = glGetUniformLocation(s_shadowBlurShader, "u_step");
+			s_shadowBlurKLoc = glGetUniformLocation(s_shadowBlurShader, "u_k");
+			glUseProgram(s_shadowBlurShader);
+			{
+				GLint loc = glGetUniformLocation(s_shadowBlurShader, "s_texture");
+				if (loc != -1) glUniform1i(loc, 0);
+			}
+			glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
+			glGenVertexArrays(1, &s_shadowBlurVAO);
+			glBindVertexArray(s_shadowBlurVAO);
+			glGenBuffers(1, &vbo);
+			glBindBuffer(GL_ARRAY_BUFFER, vbo);
+			glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+			glEnableVertexAttribArray(a_position);
+			glVertexAttribPointer(a_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+			glBindVertexArray(g_glVertexArray[g_curVertexBuffer ^ 1]);
+			glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevBuf);
+		}
+	}
+#else
 	if (g_shadowDepthShader == (ShaderID)-1)
 	{
-#if defined(PSYX_VITA)
-		/* Depth-texture mode samples the pass's depth buffer: its colour
-		 * output is unused, so the packing shader becomes a constant. */
-		s_compileShadowZPass = GR_VitaShadowZMode();
-#endif
 		g_shadowDepthShader = GR_Shader_Compile(s_shadowDepthShaderSrc);
-#if defined(PSYX_VITA)
-		s_compileShadowZPass = 0;
-#endif
 		g_shadowDepthMatrixLoc = glGetUniformLocation(g_shadowDepthShader, "u_shadowMatrix");
 	}
+#endif
 }
 
 #if defined(PSYX_VITA)
@@ -6628,9 +6805,9 @@ static void GR_VitaShadowRelink(void)
 extern "C" { unsigned g_vitaShadowStat[6]; }
 extern "C" void GR_VitaShadowStatReport(double frames)
 {
-	eprintf("[SHADOWSTAT] per frame: passes=%.2f reused=%.2f kept=%.2f casterTris=%.0f; map=%d ztex=%d aliased=%d stored=%d slope=%d\n",
+	eprintf("[SHADOWSTAT] per frame: passes=%.2f reused=%.2f kept=%.2f casterTris=%.0f; map=%d soft=%d ztex=%d aliased=%d stored=%d slope=%d\n",
 	        g_vitaShadowStat[0] / frames, g_vitaShadowStat[1] / frames, g_vitaShadowStat[2] / frames,
-	        g_vitaShadowStat[3] / frames, (int)s_shadowTexSize, GR_VitaShadowZMode(), s_shadowZAliased,
+	        g_vitaShadowStat[3] / frames, (int)s_shadowTexSize, GR_VitaShadowSoft(), GR_VitaShadowZMode(), s_shadowZAliased,
 	        s_shadowZStored, GR_VitaShadowSlope());
 	memset(g_vitaShadowStat, 0, sizeof(g_vitaShadowStat));
 }
@@ -6639,6 +6816,7 @@ int GR_ShadowMapCurrent(unsigned casterHash)
 {
 	GR_BuildShadowMatrix();
 	const int cur = s_mapValid && g_shadowFBO != 0 && casterHash == s_mapCasterHash &&
+	                s_shadowTexSoft == GR_VitaShadowSoft() && s_shadowTexSize == g_PsyX_ShadowMapSize &&
 	                memcmp(s_mapMatrix, g_shadowLightMatrix, sizeof(s_mapMatrix)) == 0;
 	g_vitaShadowStat[cur ? 1 : 0]++;
 	return cur;
@@ -6706,6 +6884,10 @@ void GR_ShadowPassBegin(void)
 	glUseProgram(g_shadowDepthShader);
 	if (g_shadowDepthMatrixLoc != -1)
 		glUniformMatrix4fv(g_shadowDepthMatrixLoc, 1, GL_FALSE, g_shadowLightMatrix);
+#if defined(PSYX_VITA)
+	if (g_shadowDepthLinLoc != -1)
+		glUniform2f(g_shadowDepthLinLoc, g_shadowZNear, 1.0f / (g_shadowZFar - g_shadowZNear));
+#endif
 }
 
 void GR_ShadowPassDraw(int startVertex, int numVerts)
@@ -6745,6 +6927,32 @@ void GR_ShadowPassEnd(void)
 		s_shadowZAliased = 1;
 		s_mapValid = 0;
 		eprintf("[SHADOWZ] shadow map sampled from the pass depth buffer\n");
+	}
+	glDisable(GL_POLYGON_OFFSET_FILL);
+	if (s_shadowTexSoft && s_shadowBlurShader != (ShaderID)-1 && s_shadowBlurFBO != 0)
+	{
+		const float blur = (g_vitaShadowSoftBlur < 0.0f) ? 0.0f : ((g_vitaShadowSoftBlur > 4.0f) ? 4.0f : g_vitaShadowSoftBlur);
+		const float st = blur / (float)PSYX_SHADOW_MAP_SIZE;
+
+		glDisable(GL_DEPTH_TEST);
+		glDepthMask(GL_FALSE);
+		glUseProgram(s_shadowBlurShader);
+		glUniform1f(s_shadowBlurKLoc, GR_VitaShadowSoftK());
+		glBindVertexArray(s_shadowBlurVAO);
+		glActiveTexture(GL_TEXTURE0);
+
+		glBindFramebuffer(GL_FRAMEBUFFER, s_shadowBlurFBO);
+		glBindTexture(GL_TEXTURE_2D, g_shadowDepthTex);
+		glUniform2f(s_shadowBlurStepLoc, st, 0.0f);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+		glBindFramebuffer(GL_FRAMEBUFFER, g_shadowFBO);
+		glBindTexture(GL_TEXTURE_2D, s_shadowBlurTex);
+		glUniform2f(s_shadowBlurStepLoc, 0.0f, st);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+		glBindVertexArray(g_glVertexArray[g_curVertexBuffer ^ 1]);
+		glDepthMask(GL_TRUE);
 	}
 #endif
 	glDisable(GL_POLYGON_OFFSET_FILL);
