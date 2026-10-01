@@ -5632,9 +5632,6 @@ void GR_ReadFramebufferDataToVRAM()
 	int x, y, w, h;
 	if (!framebuffer_need_update)
 		return;
-#if defined(PSYX_VITA)
-	VGLR_JobFence();
-#endif
 
 	framebuffer_need_update = 0;
 
@@ -5665,6 +5662,9 @@ void GR_ReadFramebufferDataToVRAM()
 	// read the texture
 	if(g_glFramebufferPBO.pixels)
 	{
+#if defined(PSYX_VITA)
+		VGLR_JobFence();
+#endif
 		glBindTexture(GL_TEXTURE_2D, g_fbTexture);
 		PBO_Download(&g_glFramebufferPBO);
 		glBindTexture(GL_TEXTURE_2D, 0);
