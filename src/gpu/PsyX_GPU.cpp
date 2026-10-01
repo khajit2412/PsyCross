@@ -3469,6 +3469,19 @@ static void DrawShadowCasters(const GPUDrawSplit& split)
 }
 
 #if defined(__vita__)
+/* The batching below works on whatever these point at: the live split list
+ * inline, a frame job's copy on the render thread (Vita_BatchInto). */
+static GPUDrawSplit* b_splits       = g_splits;
+static int*          b_splitIndex   = &g_splitIndex;
+static GrVertex*     b_vertexBuffer = g_vertexBuffer;
+static int*          b_vertexIndex  = &g_vertexIndex;
+static GrVertex**    b_drawVerts    = &s_drawVerts;
+#define g_splits       b_splits
+#define g_splitIndex   (*b_splitIndex)
+#define g_vertexBuffer b_vertexBuffer
+#define g_vertexIndex  (*b_vertexIndex)
+#define s_drawVerts    (*b_drawVerts)
+
 static bool Vita_SplitKeysMatch(const GPUDrawSplit& a, const GPUDrawSplit& b)
 {
 	return a.blendMode == b.blendMode &&
@@ -3494,6 +3507,8 @@ static void Vita_MarkUntextured(GPUDrawSplit& s, const GPUDrawSplit& vram)
 	s.textureId = g_vramTexture;
 	s.texFormat = vram.texFormat;
 	s.palKey = vram.palKey;
+	s.palTex = vram.palTex;
+	s.palOpaque = vram.palOpaque;
 }
 
 /* A draw call costs ~20 us on vitaGL and interiors issue ~800 a frame, most of
@@ -3760,6 +3775,27 @@ static void Vita_BatchSplits()
 	}
 	g_splitIndex = out;
 }
+
+#undef g_splits
+#undef g_splitIndex
+#undef g_vertexBuffer
+#undef g_vertexIndex
+#undef s_drawVerts
+
+/* Batches splits[1..*nSplits] over verts[0..*nVerts) in place and returns
+ * the vertex array to draw from (the reorder writes its own copy). */
+static GrVertex* Vita_BatchInto(GPUDrawSplit* splits, int* nSplits, GrVertex* verts, int* nVerts)
+{
+	GrVertex* draw = verts;
+	b_splits = splits; b_splitIndex = nSplits;
+	b_vertexBuffer = verts; b_vertexIndex = nVerts;
+	b_drawVerts = &draw;
+	Vita_BatchSplits();
+	b_splits = g_splits; b_splitIndex = &g_splitIndex;
+	b_vertexBuffer = g_vertexBuffer; b_vertexIndex = &g_vertexIndex;
+	b_drawVerts = &s_drawVerts;
+	return draw;
+}
 #endif
 
 #if defined(__vita__)
@@ -3894,11 +3930,14 @@ static void DrawSplitsExec(const GPUDrawSplit* splits, int nSplits, const GrVert
 
 static void DrawSplitsJob(void* payload)
 {
-	const char* p = (const char*)payload;
-	const DrawJobHdr* h = (const DrawJobHdr*)p;
+	char* p = (char*)payload;
+	DrawJobHdr* h = (DrawJobHdr*)p;
+	GPUDrawSplit* splits = (GPUDrawSplit*)(p + h->splitOff);
 	GR_RSnapInstall(p + h->rsOff);
-	DrawSplitsExec((const GPUDrawSplit*)(p + h->splitOff), h->nSplits,
-	               (const GrVertex*)(p + h->vertOff), h->nVerts, h->shadowPass);
+	const unsigned long long bt = SPLIT_T();
+	const GrVertex* verts = Vita_BatchInto(splits, &h->nSplits, (GrVertex*)(p + h->vertOff), &h->nVerts);
+	g_submitUs[0] += SPLIT_T() - bt;
+	DrawSplitsExec(&splits[1], h->nSplits, verts, h->nVerts, h->shadowPass);
 	GR_RSnapInstall(NULL);
 }
 #endif
@@ -3937,7 +3976,6 @@ void DrawAllSplits()
 #if defined(__vita__)
 	const unsigned long long sb0 = SPLIT_T();
 	s_drawVerts = g_vertexBuffer;
-	Vita_BatchSplits();
 
 	int inlineOnly = !VGLR_JobsEnabled();
 	for (int i = 1; i <= g_splitIndex; i++)
@@ -3970,8 +4008,7 @@ void DrawAllSplits()
 				GR_ShadowMapKeep();
 		}
 	}
-	const unsigned long long sb1 = SPLIT_T();
-	g_submitUs[0] += sb1 - sb0;
+	(void)sb0;
 
 	if (g_PsxUsePgxp && g_splitIndex > s_dbgSplitHighWater)
 		s_dbgSplitHighWater = g_splitIndex;
@@ -3980,7 +4017,7 @@ void DrawAllSplits()
 	{
 		const size_t hdrBytes   = (sizeof(DrawJobHdr) + 7) & ~(size_t)7;
 		const size_t rsBytes    = ((size_t)GR_RSnapSize() + 7) & ~(size_t)7;
-		const size_t splitBytes = ((size_t)g_splitIndex * sizeof(GPUDrawSplit) + 7) & ~(size_t)7;
+		const size_t splitBytes = ((size_t)(g_splitIndex + 1) * sizeof(GPUDrawSplit) + 7) & ~(size_t)7;
 		const size_t vertBytes  = (size_t)g_vertexIndex * sizeof(GrVertex);
 		char* p = (char*)VGLR_JobBegin(DrawSplitsJob, hdrBytes + rsBytes + splitBytes + vertBytes);
 		if (p)
@@ -3993,7 +4030,7 @@ void DrawAllSplits()
 			h->splitOff   = (int)(hdrBytes + rsBytes);
 			h->vertOff    = (int)(hdrBytes + rsBytes + splitBytes);
 			GR_RSnapCapture(p + h->rsOff);
-			memcpy(p + h->splitOff, &g_splits[1], (size_t)g_splitIndex * sizeof(GPUDrawSplit));
+			memcpy(p + h->splitOff, &g_splits[0], (size_t)(g_splitIndex + 1) * sizeof(GPUDrawSplit));
 			memcpy(p + h->vertOff, s_drawVerts, vertBytes);
 			VGLR_JobEnd();
 			g_vitaFrameJobs[0]++;
@@ -4006,6 +4043,11 @@ void DrawAllSplits()
 	 * job from an earlier flush. */
 	VGLR_JobFence();
 	g_vitaFrameJobs[1]++;
+	{
+		const unsigned long long bt = SPLIT_T();
+		s_drawVerts = Vita_BatchInto(g_splits, &g_splitIndex, g_vertexBuffer, &g_vertexIndex);
+		g_submitUs[0] += SPLIT_T() - bt;
+	}
 	DrawSplitsExec(&g_splits[1], g_splitIndex, s_drawVerts, g_vertexIndex, shadowPass);
 #else
 	GR_UpdateVertexBuffer(s_drawVerts, g_vertexIndex);

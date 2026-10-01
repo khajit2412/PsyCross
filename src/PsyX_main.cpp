@@ -1184,6 +1184,7 @@ extern "C" void (*g_PsyX_PostCaptureHook)(void) = NULL;
 extern "C" unsigned long long g_splitUs[4];
 extern "C" unsigned long long g_submitUs[4];
 extern "C" unsigned g_vitaFrameJobs[2];
+extern "C" const char* Pc_ModConfig_Value(const char* key);
 extern "C" unsigned long long g_vitaBeamTris[2];
 extern "C" void GR_VitaShadowStatReport(double frames);
 extern "C" unsigned long long g_vitaProfUs[4];
@@ -1288,7 +1289,15 @@ void PsyX_EndScene()
 	 * follows is then pure display-queue / vitaGL garbage-collector waiting. */
 	static Uint64 s_drainUs, s_drainMaxUs, s_drainSwapUs;
 	static unsigned s_drainN;
-	const int drainFrame = (s_esFrames % 60) == 30;
+	/* Off by default: the glFinish waits out the whole GPU queue, 40-190 ms
+	 * outside, and was the regular gameplay hitch. Config vita_gpu_drain = 1. */
+	static int s_drainOn = -1;
+	if (s_drainOn < 0)
+	{
+		const char* v = Pc_ModConfig_Value("vita_gpu_drain");
+		s_drainOn = (v && v[0] == '1');
+	}
+	const int drainFrame = s_drainOn && (s_esFrames % 60) == 30;
 	if (drainFrame)
 	{
 		const Uint64 d0 = SDL_GetPerformanceCounter();
