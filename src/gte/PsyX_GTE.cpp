@@ -733,6 +733,188 @@ extern "C" void PGXP_MatrixStoreColumn(void* columnPtr) {
 	}
 }
 
+#if defined(__vita__)
+/* World meshes (func_80057B7C): the RTPT loop over a whole mesh in one call.
+ * The integer results the game reads (screen XY, SZ) come out bit-identical to
+ * GTE_RotTransPers -- same products, saturation and UNR divide -- and the PGXP
+ * and view-space shadows get what that path and PGXP_StoreAddr would record,
+ * but the exact camera transform is fetched once per mesh instead of per
+ * vertex and the six-register load, generic dispatch and FIFO traffic go.
+ * Returns the vertex count processed (whole triples, the first one always,
+ * as the original loop), or 0 to run the original loop (config
+ * vita_fast_mesh = 0, whole-map far mode). */
+/* SH1's vertex-lighting pass (func_80057658) runs RTPS with the light
+ * vector in row 2 and V0 = row 2, under H = 16 / offset -1024 (see
+ * PGXP_StoreAddr). This is that RTPS for the SXY2 and IR0 it reads, with the
+ * same integer arithmetic; nothing of it is ever drawn. */
+extern "C" const char* Pc_ModConfig_Value(const char* key);
+int GTE_operator(int op);
+static int PsyX_FastMeshOn(void)
+{
+	static int on = -1;
+	if (on < 0)
+	{
+		const char* v = Pc_ModConfig_Value("vita_fast_mesh");
+		on = !(v && v[0] == '0');
+	}
+	return on;
+}
+
+extern "C" void PsyX_LightRtps(const void* mat, void* sxyOut, void* dpOut)
+{
+	const short* m = (const short*)mat;
+	if (!PsyX_FastMeshOn())
+	{
+		gteRegs.CP2D.p[0].d = (unsigned)(unsigned short)m[6] | ((unsigned)(unsigned short)m[7] << 16);
+		C2_VZ0 = m[8];
+		GTE_operator(0x0180001);
+		*(unsigned*)sxyOut = (unsigned)C2_SXY2;
+		*(unsigned*)dpOut = (unsigned)C2_IR0;
+		return;
+	}
+	const long long vx = m[6], vy = m[7], vz = m[8];
+	const long long m1 = ((long long)C2_TRX << 12) + (int)(m[0] * vx) + (int)(m[1] * vy) + (int)(m[2] * vz);
+	const long long m2 = ((long long)C2_TRY << 12) + (int)(m[3] * vx) + (int)(m[4] * vy) + (int)(m[5] * vz);
+	const long long m3 = ((long long)C2_TRZ << 12) + (int)(m[6] * vx) + (int)(m[7] * vy) + (int)(m[8] * vz);
+	const int mac1 = (int)(m1 >> 12), mac2 = (int)(m2 >> 12);
+	const int ir1 = mac1 > 0x7fff ? 0x7fff : (mac1 < -0x8000 ? -0x8000 : mac1);
+	const int ir2 = mac2 > 0x7fff ? 0x7fff : (mac2 < -0x8000 ? -0x8000 : mac2);
+	int sz = (int)(m3 >> 12);
+	if (sz > 0xffff) sz = 0xffff; else if (sz < 0) sz = 0;
+	unsigned hs = gte_divide((unsigned short)C2_H, (unsigned short)sz);
+	if (hs > 0x1ffff) hs = 0x1ffff;
+	long long sx = ((long long)C2_OFX + (long long)ir1 * (int)hs) >> 16;
+	long long sy = ((long long)C2_OFY + (long long)ir2 * (int)hs) >> 16;
+	if (sx > 0x3ff) sx = 0x3ff; else if (sx < -0x400) sx = -0x400;
+	if (sy > 0x3ff) sy = 0x3ff; else if (sy < -0x400) sy = -0x400;
+	long long ir0 = ((long long)C2_DQB + (long long)C2_DQA * (int)hs) >> 12;
+	if (ir0 < 0) ir0 = 0; else if (ir0 > 0x1000) ir0 = 0x1000;
+	*(unsigned*)sxyOut = ((unsigned)sx & 0xFFFF) | ((unsigned)sy << 16);
+	*(unsigned*)dpOut = (unsigned)ir0;
+}
+
+extern "C" int PGXP_FastMeshRTPT(void* xyv, short* z, int count)
+{
+	if (!PsyX_FastMeshOn() || g_PsxWholeMapFar)
+		return 0;
+
+	unsigned* xy = (unsigned*)xyv;
+	const int n = (count <= 3) ? 3 : ((count + 2) / 3) * 3;
+	const long long r11 = C2_R11, r12 = C2_R12, r13 = C2_R13;
+	const long long r21 = C2_R21, r22 = C2_R22, r23 = C2_R23;
+	const long long r31 = C2_R31, r32 = C2_R32, r33 = C2_R33;
+	const long long trx = (long long)C2_TRX << 12, try_ = (long long)C2_TRY << 12, trz = (long long)C2_TRZ << 12;
+	const int ofx = C2_OFX, ofy = C2_OFY;
+	const unsigned short h = (unsigned short)C2_H;
+	const int pgxp = g_PsxUsePgxp;
+	const int vs = GR_NeedViewSpaceData();
+	const float fofx = (float)ofx * (1.0f / 65536.0f), fofy = (float)ofy * (1.0f / 65536.0f), fh = (float)h;
+	double exR[9], exT[3];
+	const int exact = pgxp && CurrentExact(exR) && CurrentExactTranslation(exT);
+	int prevSz = C2_SZ3;
+	int lastMac1 = 0, lastMac2 = 0, lastMac3 = 0, lastIr1 = 0, lastIr2 = 0, lastIr3 = 0, lastHs = 0;
+	float fx = 0.0f, fy = 0.0f, fw = 0.0f;
+
+	if (pgxp)
+	{
+		g_PgxpGteOfx = fofx;
+		g_PgxpGteOfy = fofy;
+		g_PgxpGteH   = fh;
+	}
+
+	for (int i = 0; i < n; i++)
+	{
+		const long long vx = (short)(xy[i] & 0xFFFF), vy = (short)(xy[i] >> 16), vz = z[i];
+		const long long m1 = trx  + (int)(r11 * vx) + (int)(r12 * vy) + (int)(r13 * vz);
+		const long long m2 = try_ + (int)(r21 * vx) + (int)(r22 * vy) + (int)(r23 * vz);
+		const long long m3 = trz  + (int)(r31 * vx) + (int)(r32 * vy) + (int)(r33 * vz);
+		const int mac1 = (int)(m1 >> 12), mac2 = (int)(m2 >> 12), mac3 = (int)(m3 >> 12);
+		const int ir1 = mac1 > 0x7fff ? 0x7fff : (mac1 < -0x8000 ? -0x8000 : mac1);
+		const int ir2 = mac2 > 0x7fff ? 0x7fff : (mac2 < -0x8000 ? -0x8000 : mac2);
+		const int ir3 = mac3 > 0x7fff ? 0x7fff : (mac3 < -0x8000 ? -0x8000 : mac3);
+		int sz = (int)(m3 >> 12);
+		if (sz > 0xffff) sz = 0xffff; else if (sz < 0) sz = 0;
+		unsigned hs = gte_divide(h, (unsigned short)sz);
+		if (hs > 0x1ffff) hs = 0x1ffff;
+		long long sx = ((long long)ofx + (long long)ir1 * (int)hs) >> 16;
+		long long sy = ((long long)ofy + (long long)ir2 * (int)hs) >> 16;
+		if (sx > 0x3ff) sx = 0x3ff; else if (sx < -0x400) sx = -0x400;
+		if (sy > 0x3ff) sy = 0x3ff; else if (sy < -0x400) sy = -0x400;
+
+		const unsigned packed = ((unsigned)sx & 0xFFFF) | ((unsigned)sy << 16);
+		xy[i] = packed;
+		z[i] = (short)sz;
+
+		if (pgxp)
+		{
+			if (sz > 0)
+			{
+				const double ratio = (double)h / (double)sz;
+				fx = (float)((double)ofx / 65536.0 + (double)ir1 * ratio);
+				fy = (float)((double)ofy / 65536.0 + (double)ir2 * ratio);
+				fw = g_PgxpUseUnquantizedDepth ? (float)(m3 >> 12) : (float)sz;
+			}
+			else
+			{
+				fx = (float)sx; fy = (float)sy; fw = 0.0f;
+			}
+			if (exact)
+			{
+				const double tvX = exT[0] + exR[0] * (double)vx + exR[1] * (double)vy + exR[2] * (double)vz;
+				const double tvY = exT[1] + exR[3] * (double)vx + exR[4] * (double)vy + exR[5] * (double)vz;
+				const double tvZ = exT[2] + exR[6] * (double)vx + exR[7] * (double)vy + exR[8] * (double)vz;
+				if (tvZ > 0.0)
+				{
+					const double ratio = (double)h / tvZ;
+					fx = (float)((double)ofx / 65536.0 + tvX * ratio);
+					fy = (float)((double)ofy / 65536.0 + tvY * ratio);
+					fw = g_PgxpUseUnquantizedDepth ? (float)tvZ : (float)sz;
+				}
+			}
+			Shadow_Store(&xy[i], fx, fy, fw, packed);
+		}
+		if (vs)
+			VShadow_Store(&xy[i], (float)mac1, (float)mac2, (float)mac3, fofx, fofy, fh);
+
+		if (i == n - 4)
+			prevSz = sz;
+		lastMac1 = mac1; lastMac2 = mac2; lastMac3 = mac3;
+		lastIr1 = ir1; lastIr2 = ir2; lastIr3 = ir3; lastHs = (int)hs;
+		if (pgxp && i >= n - 3)
+		{
+			const int k = i - (n - 3);
+			s_pgxpFifoX[k] = fx; s_pgxpFifoY[k] = fy; s_pgxpFifoW[k] = fw;
+		}
+		if (vs && i >= n - 3)
+		{
+			const int k = i - (n - 3);
+			s_vsFifoX[k] = (float)mac1; s_vsFifoY[k] = (float)mac2; s_vsFifoZ[k] = (float)mac3;
+			s_vsFifoOfx[k] = fofx; s_vsFifoOfy[k] = fofy; s_vsFifoH[k] = fh;
+		}
+	}
+
+	/* Leave the registers as the last RTPT would. */
+	C2_SXY0 = xy[n - 3];
+	C2_SXY1 = xy[n - 2];
+	C2_SXY2 = xy[n - 1];
+	C2_SZ0 = prevSz;
+	C2_SZ1 = (unsigned short)z[n - 3];
+	C2_SZ2 = (unsigned short)z[n - 2];
+	C2_SZ3 = (unsigned short)z[n - 1];
+	C2_MAC1 = lastMac1; C2_MAC2 = lastMac2; C2_MAC3 = lastMac3;
+	C2_IR1 = lastIr1; C2_IR2 = lastIr2; C2_IR3 = lastIr3;
+	{
+		const long long mac0 = (long long)C2_DQB + (long long)C2_DQA * lastHs;
+		long long ir0 = mac0 >> 12;
+		if (ir0 < 0) ir0 = 0; else if (ir0 > 0x1000) ir0 = 0x1000;
+		C2_MAC0 = (int)mac0;
+		C2_IR0 = (int)ir0;
+	}
+	C2_FLAG = 0;
+	return n;
+}
+#endif
+
 int GTE_RotTransPers(int idx, int lm)
 {
 	int h_over_sz3;
