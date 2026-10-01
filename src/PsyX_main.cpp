@@ -607,6 +607,12 @@ void PsyX_Log_Finalise()
 
 void PsyX_Log_Flush()
 {
+#if defined(__vita__)
+	/* The host's log: its once-a-second flush covers it. Flushing here wrote
+	 * to the memory card every frame that logged anything. */
+	if (g_logStreamExternal)
+		return;
+#endif
 	if (g_logStream)
 		fflush(g_logStream);
 }
