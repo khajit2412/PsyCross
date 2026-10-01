@@ -7095,8 +7095,8 @@ void GR_ShadowMapKeep(void)
 }
 
 /* Shadow map refresh rate while the casters or the light move (config
- * vita_shadow_rate, default 2 = at most every second frame, 1 = every frame).
- * A skipped frame keeps the last map and the light it was drawn from. */
+ * vita_shadow_rate, default 1 = every frame; 2 = every second frame read as
+ * flicker on device). A skipped frame keeps the last map and its light. */
 static unsigned s_mapScene;
 
 int GR_ShadowMapDue(void)
@@ -7105,7 +7105,7 @@ int GR_ShadowMapDue(void)
 	if (rate < 0)
 	{
 		const char* v = Pc_ModConfig_Value("vita_shadow_rate");
-		rate = v ? atoi(v) : 2;
+		rate = v ? atoi(v) : 1;
 		if (rate < 1) rate = 1;
 		if (rate > 4) rate = 4;
 	}

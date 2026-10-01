@@ -3506,10 +3506,10 @@ static void Vita_MarkUntextured(GPUDrawSplit& s, const GPUDrawSplit& vram)
  * OT interleaves small prims with different palettes: 450 draws a frame.
  * Splits covering less than this screen area (PSX pixels, bounding box) fall
  * back to the VRAM path, where they merge with their neighbours again. */
-/* 4096 PSX pixels (64x64, ~1/18 of the screen): outside, palette splits were
- * most of 480 draws a frame at ~20 us of render-thread time each. Config
- * vita_pal_min_area. */
-extern "C" { int g_vitaPalMinArea = 4096; }
+/* Off by default: at 4096 PSX pixels nearly every world split fell back to the
+ * VRAM decode (480 -> 76 draws, but the GPU backlog went 85 -> 150+ ms).
+ * Config vita_pal_min_area. */
+extern "C" { int g_vitaPalMinArea = 0; }
 
 static void Vita_DropSmallPaletteSplits()
 {
