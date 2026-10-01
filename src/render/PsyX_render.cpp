@@ -7094,8 +7094,32 @@ void GR_ShadowMapKeep(void)
 		memcpy(g_shadowLightMatrix, s_mapMatrix, sizeof(s_mapMatrix));
 }
 
+/* Shadow map refresh rate while the casters or the light move (config
+ * vita_shadow_rate, default 2 = at most every second frame, 1 = every frame).
+ * A skipped frame keeps the last map and the light it was drawn from. */
+static unsigned s_mapScene;
+
+int GR_ShadowMapDue(void)
+{
+	static int rate = -1;
+	if (rate < 0)
+	{
+		const char* v = Pc_ModConfig_Value("vita_shadow_rate");
+		rate = v ? atoi(v) : 2;
+		if (rate < 1) rate = 1;
+		if (rate > 4) rate = 4;
+	}
+	return !s_mapValid || s_vitaSceneNo - s_mapScene >= (unsigned)rate;
+}
+
+void GR_ShadowLightMatrix(float out[16])
+{
+	memcpy(out, RS(g_shadowLightMatrix), sizeof(float) * 16);
+}
+
 void GR_ShadowMapWritten(unsigned casterHash)
 {
+	s_mapScene = s_vitaSceneNo;
 	memcpy(s_mapMatrix, g_shadowLightMatrix, sizeof(s_mapMatrix));
 	s_mapCasterHash = casterHash;
 	s_mapValid = 1;

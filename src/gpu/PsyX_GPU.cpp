@@ -3506,7 +3506,10 @@ static void Vita_MarkUntextured(GPUDrawSplit& s, const GPUDrawSplit& vram)
  * OT interleaves small prims with different palettes: 450 draws a frame.
  * Splits covering less than this screen area (PSX pixels, bounding box) fall
  * back to the VRAM path, where they merge with their neighbours again. */
-extern "C" { int g_vitaPalMinArea = 0; }
+/* 4096 PSX pixels (64x64, ~1/18 of the screen): outside, palette splits were
+ * most of 480 draws a frame at ~20 us of render-thread time each. Config
+ * vita_pal_min_area. */
+extern "C" { int g_vitaPalMinArea = 4096; }
 
 static void Vita_DropSmallPaletteSplits()
 {
@@ -3789,28 +3792,85 @@ static int AnyShadowCaster(void)
 	return 0;
 }
 
+static GrVertex* s_casterVerts;
+static int       s_casterCap;
+
+/* Copies the opaque caster triangles that can land in the shadow map (all
+ * three vertices outside one light-clip plane = can't) and returns the vertex
+ * count. Each frame-job flush runs this on the render thread. */
+static int GatherShadowCasters(const GPUDrawSplit* splits, int nSplits, const GrVertex* verts)
+{
+	float m[16];
+	int n = 0;
+
+	GR_ShadowLightMatrix(m);
+	for (int i = 0; i < nSplits; i++)
+	{
+		const GPUDrawSplit& s = splits[i];
+		if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3 || s.blendMode != BM_NONE)
+			continue;
+		if (n + (int)s.numVerts > s_casterCap)
+		{
+			const int cap = (n + (int)s.numVerts) * 2;
+			GrVertex* nv = (GrVertex*)realloc(s_casterVerts, (size_t)cap * sizeof(GrVertex));
+			if (!nv)
+				break;
+			s_casterVerts = nv;
+			s_casterCap = cap;
+		}
+		const GrVertex* v = &verts[s.startVertex];
+		for (unsigned o = 0; o + 2 < s.numVerts; o += 3)
+		{
+			if (!ShadowTriangleCanCast(&v[o]))
+				continue;
+			unsigned all = 0x3F;
+			for (int k = 0; k < 3; k++)
+			{
+				const float x = v[o + k].vsx, y = v[o + k].vsy, z = v[o + k].vsz;
+				const float cx = m[0] * x + m[4] * y + m[8]  * z + m[12];
+				const float cy = m[1] * x + m[5] * y + m[9]  * z + m[13];
+				const float cz = m[2] * x + m[6] * y + m[10] * z + m[14];
+				const float cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+				unsigned code = 0;
+				if (cx < -cw) code |= 1;
+				if (cx >  cw) code |= 2;
+				if (cy < -cw) code |= 4;
+				if (cy >  cw) code |= 8;
+				if (cw <= 0.0f) code |= 16;
+				if (cz >  cw) code |= 32;
+				all &= code;
+			}
+			if (all)
+				continue;
+			memcpy(&s_casterVerts[n], &v[o], 3 * sizeof(GrVertex));
+			n += 3;
+		}
+	}
+	return n;
+}
+
 /* Upload, shadow pass and split loop for one flush: on the game thread when
  * inline, on the render thread inside a frame job. */
 static void DrawSplitsExec(const GPUDrawSplit* splits, int nSplits, const GrVertex* verts, int nVerts, int shadowPass)
 {
 	const unsigned long long sb1 = SPLIT_T();
 	s_execVerts = verts;
-	GR_UpdateVertexBuffer(verts, nVerts);
-	const unsigned long long sb2 = SPLIT_T();
 
+	/* The casters inside the light's frustum, gathered into one buffer and
+	 * drawn with one call before the frame's own vertices go up. Every
+	 * caster run used to be its own draw, most of them outside the beam. */
 	if (shadowPass)
 	{
-		s_shadowPassOpen = false;
-		for (int i = 0; i < nSplits; i++)
-		{
-			const GPUDrawSplit& s = splits[i];
-			if (s.kind != GPU_SPLIT_LEGACY || s.numVerts < 3 || s.blendMode != BM_NONE)
-				continue;
-			DrawShadowCasters(s);
-		}
-		if (s_shadowPassOpen)
-			GR_ShadowPassEnd();
+		const int n = GatherShadowCasters(splits, nSplits, verts);
+		if (n)
+			GR_UpdateVertexBuffer(s_casterVerts, n);
+		GR_ShadowPassBegin();
+		if (n)
+			GR_ShadowPassDraw(0, n);
+		GR_ShadowPassEnd();
 	}
+	const unsigned long long sb2 = SPLIT_T();
+	GR_UpdateVertexBuffer(verts, nVerts);
 	const unsigned long long sb3 = SPLIT_T();
 
 	s_beamOn = GR_VitaBeamBegin();
@@ -3826,8 +3886,8 @@ static void DrawSplitsExec(const GPUDrawSplit* splits, int nSplits, const GrVert
 	}
 
 	const unsigned long long sb4 = SPLIT_T();
-	g_submitUs[1] += sb2 - sb1;
-	g_submitUs[2] += sb3 - sb2;
+	g_submitUs[1] += sb3 - sb2;
+	g_submitUs[2] += sb2 - sb1;
 	g_submitUs[3] += sb4 - sb3;
 	s_execVerts = s_drawVerts;
 }
@@ -3899,7 +3959,9 @@ void DrawAllSplits()
 			GR_ShadowMapKeep();
 		else if (!GR_ShadowMapCurrent(casterHash))
 		{
-			if (AnyShadowCaster())
+			if (!GR_ShadowMapDue())
+				GR_ShadowMapKeep();
+			else if (AnyShadowCaster())
 			{
 				shadowPass = 1;
 				GR_ShadowMapWritten(casterHash);

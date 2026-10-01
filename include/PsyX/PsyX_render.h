@@ -479,6 +479,8 @@ extern void			GR_ShadowPassBegin(void);
 extern int			GR_ShadowMapCurrent(unsigned casterHash);
 extern void			GR_ShadowMapWritten(unsigned casterHash);
 extern void			GR_ShadowMapKeep(void);
+extern int			GR_ShadowMapDue(void);
+extern void			GR_ShadowLightMatrix(float out[16]);
 #endif
 extern void			GR_ShadowPassDraw(int start_vertex, int num_verts);
 extern void			GR_ShadowPassEnd(void);
