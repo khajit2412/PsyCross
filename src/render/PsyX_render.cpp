@@ -5231,8 +5231,13 @@ TextureID GR_VitaPaletteTexture(int key, int* opaque)
 		glBindTexture(GL_TEXTURE_2D, s_palc[idx].tex);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+		/* Clamp, not repeat: a fragment whose interpolated u lands a hair
+		 * below 0 at a prim's edge rounds to texel -1, which repeat wrapped
+		 * to 255 on the far side of the page (a bright line beside the lamp
+		 * glow sprites). PSX UVs are 8-bit inside the page and never wrap
+		 * that way. */
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	}
 
 	/* Colour v5*8/256 is what the VRAM path's decode outputs; rounded to 8 bits
