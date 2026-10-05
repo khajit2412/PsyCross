@@ -4445,7 +4445,7 @@ void GR_SetShader(const ShaderID shader)
 struct GR_VitaUniSig
 {
 	ShaderID prog;
-	int   pgxp, voidProbe, fogToBlack, flOn, untex, flStyle, fpsMode, shadowOn, soft, mapSize;
+	int   pgxp, voidProbe, flOn, untex, flStyle, fpsMode, shadowOn, soft, mapSize;
 	int   dither, winW, ditherSup, menuFilter, texFormat, texFilter, aniso;
 	float szMax, farBias, farW, fogStr, flDim;
 	float fog[3], o[3], d[3], col[3];
@@ -4461,7 +4461,7 @@ static int GR_VitaUniformsCurrent(ShaderID prog, TextureID texture, TexFormat te
 	GR_VitaUniSig g;
 	memset(&g, 0, sizeof(g));
 	g.prog = prog;
-	g.pgxp = RS(g_PsxUsePgxp); g.voidProbe = RS(g_PsxVoidProbeArmed) == 2; g.fogToBlack = g_PsxFogToBlack;
+	g.pgxp = RS(g_PsxUsePgxp); g.voidProbe = RS(g_PsxVoidProbeArmed) == 2;
 	g.flOn = RS(g_PsyX_UsePerPixelFlashlight) && RS(g_PsyX_FlashlightActive);
 	g.untex = texture == g_whiteTexture; g.flStyle = RS(g_PsyX_FlashlightStyle) != 0;
 	g.fpsMode = RS(g_PsyX_FlashlightFpsMode); g.shadowOn = shadowOn;
@@ -4673,8 +4673,13 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	                 !RS(g_PsxPresentLastFrame)) ? 1 : 0;
 	if (GR_VitaShadowZMode() && !s_shadowZStored)
 		shadowOnV = 0;
+	/* Both are also uploaded by GR_SetBlendMode, so they stay out of the
+	 * signature and go every time (a skipped u_fogToBlack left fogged
+	 * surfaces fading to black after any additive effect). */
 	if (u_blendSrcLoc != -1)
 		glUniform2fv(u_blendSrcLoc, 1, g_PsxBlendSrc);
+	if (u_fogToBlackLoc != -1)
+		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
 	const int uniSkip = GR_VitaUniformsCurrent(shader->shader, texture, texFormat, shadowOnV);
 	if (!uniSkip)
 	{
@@ -4705,9 +4710,9 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	if (u_voidProbeLoc != -1)
 		glUniform1i(u_voidProbeLoc, RS(g_PsxVoidProbeArmed) == 2 ? 1 : 0);
 
+#if !defined(PSYX_VITA)
 	if (u_fogToBlackLoc != -1)
 		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
-#if !defined(PSYX_VITA)
 	if (u_blendSrcLoc != -1)
 		glUniform2fv(u_blendSrcLoc, 1, g_PsxBlendSrc);
 #endif
