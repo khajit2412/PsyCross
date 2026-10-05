@@ -310,6 +310,11 @@ typedef struct
 	 * "no bounds known" and the shader skips the clamp, so prim paths that
 	 * never set them keep the old behaviour. DuckStation's approach. */
 	u_char		ulo, vlo, uhi, vhi;
+
+	/* Vita: this triangle's view-space unit normal (x127), filled on the
+	 * render thread before upload so the Modern flashlight does not rebuild it
+	 * per pixel from screen derivatives. */
+	char		fnx, fny, fnz, fnpad;
 } GrVertex;
 
 typedef struct GrModernVertex
@@ -333,6 +338,7 @@ typedef enum
 	a_viewpos,
 	a_geom3d,
 	a_uvlim,
+	a_fnormal,
 } ShaderAttrib;
 
 typedef enum

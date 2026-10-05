@@ -2815,6 +2815,9 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"	attribute vec3 a_normal; // .z = character fade (0 lit, 1 faded out)\n"\
 	"	attribute float a_geom3d; // 1 = GTE-projected primitive (world geometry)\n"\
 	"	attribute vec4 a_uvlim; // per-poly UV bounds (texels), all-zero = none\n"\
+	"#ifdef PSYX_FNORMAL\n"\
+	"	attribute vec4 a_fnormal;\n"\
+	"#endif\n"\
 	"	uniform mat4 Projection;\n"\
 	"	uniform mat4 Projection3D;\n"\
 	"	uniform int u_pgxpEnabled;\n"\
@@ -2849,6 +2852,9 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	"		v_fogAmount = clamp(a_extra.z / 127.0, 0.0, 1.0);\n"\
 	"		v_viewpos = a_viewpos;\n"\
 	"		v_fade = a_normal.z;\n"\
+	"#ifdef PSYX_FNORMAL\n"\
+	"		v_fnormal = a_fnormal.xyz;\n"\
+	"#endif\n"\
 	/* a_normal.y is 1.0 only for a vertex that carried a view-space FIFO
 	 * entry, i.e. one the GTE actually projected -- a true "this is world
 	 * geometry" marker. v_is3d cannot answer that: it reads a_pgxp.z, which
@@ -3015,8 +3021,12 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 
 #if defined(PSYX_VITA)
 #	define GPU_FL_FACE_NORMAL\
+	"#ifdef PSYX_FNORMAL\n"\
+	"					vec3 N = v_fnormal;\n"\
+	"#else\n"\
 	"					vec3 flN = cross(dFdx(flP), dFdy(flP));\n"\
-	"					vec3 N = flN * inversesqrt(max(dot(flN, flN), 1e-18));\n"
+	"					vec3 N = flN * inversesqrt(max(dot(flN, flN), 1e-18));\n"\
+	"#endif\n"
 #else
 #	define GPU_FL_FACE_NORMAL\
 	"					vec3 flN = cross(dFdx(flP), dFdy(flP));\n"\
@@ -3315,7 +3325,13 @@ const char* gte_shader_4 =
 	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
 	GTE_SCALAR_VARYINGS
 	"varying vec3 v_viewpos;\n"
+	"#ifdef PSYX_FNORMAL\n"
+	"varying vec4 v_fnFade;\n"
+	"#define v_fade v_fnFade.w\n"
+	"#define v_fnormal v_fnFade.xyz\n"
+	"#else\n"
 	"varying float v_fade;\n"
+	"#endif\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef PSYX_SHADOW_VS\n"
@@ -3336,7 +3352,13 @@ const char* gte_shader_8 =
 	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
 	GTE_SCALAR_VARYINGS
 	"varying vec3 v_viewpos;\n"
+	"#ifdef PSYX_FNORMAL\n"
+	"varying vec4 v_fnFade;\n"
+	"#define v_fade v_fnFade.w\n"
+	"#define v_fnormal v_fnFade.xyz\n"
+	"#else\n"
 	"varying float v_fade;\n"
+	"#endif\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef PSYX_SHADOW_VS\n"
@@ -3357,7 +3379,13 @@ const char* gte_shader_16 =
 	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
 	GTE_SCALAR_VARYINGS
 	"varying vec3 v_viewpos;\n"
+	"#ifdef PSYX_FNORMAL\n"
+	"varying vec4 v_fnFade;\n"
+	"#define v_fade v_fnFade.w\n"
+	"#define v_fnormal v_fnFade.xyz\n"
+	"#else\n"
 	"varying float v_fade;\n"
+	"#endif\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef PSYX_SHADOW_VS\n"
@@ -3378,7 +3406,13 @@ const char* gte_shader_32_rgba =
 	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
 	GTE_SCALAR_VARYINGS
 	"varying vec3 v_viewpos;\n"
+	"#ifdef PSYX_FNORMAL\n"
+	"varying vec4 v_fnFade;\n"
+	"#define v_fade v_fnFade.w\n"
+	"#define v_fnormal v_fnFade.xyz\n"
+	"#else\n"
 	"varying float v_fade;\n"
+	"#endif\n"
 	"varying vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef PSYX_SHADOW_VS\n"
@@ -3728,6 +3762,8 @@ ShaderID GR_Shader_Compile(const char* source)
 		}
 		if (!s_litNoHalf)
 			strcat(extra_fs_defines, "#define PSYX_LIT_HALF\n");
+		strcat(extra_fs_defines, "#define PSYX_FNORMAL\n");
+		strcat(extra_vs_defines, "#define PSYX_FNORMAL\n");
 	}
 	if (s_compileShadowEsm)
 		strcat(extra_fs_defines, "#define PSYX_SHADOW_ESM\n");
@@ -3794,6 +3830,7 @@ ShaderID GR_Shader_Compile(const char* source)
 	glBindAttribLocation(program, a_viewpos, "a_viewpos");
 	glBindAttribLocation(program, a_geom3d, "a_geom3d");
 	glBindAttribLocation(program, a_uvlim, "a_uvlim");
+	glBindAttribLocation(program, a_fnormal, "a_fnormal");
 
 	glLinkProgram(program);
 	if(GR_Shader_CheckProgramStatus(program) == 0)
@@ -9364,6 +9401,8 @@ void GR_BindVertexBuffer()
 	glEnableVertexAttribArray(a_geom3d);
 	glVertexAttribPointer(a_uvlim, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->ulo);
 	glEnableVertexAttribArray(a_uvlim);
+	glVertexAttribPointer(a_fnormal, 4, GL_BYTE, GL_TRUE, sizeof(GrVertex), &((GrVertex*)NULL)->fnx);
+	glEnableVertexAttribArray(a_fnormal);
 
 	g_curVertexBuffer++;
 	g_curVertexBuffer &= 1;

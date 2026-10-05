@@ -3887,10 +3887,37 @@ static int GatherShadowCasters(const GPUDrawSplit* splits, int nSplits, const Gr
 
 /* Upload, shadow pass and split loop for one flush: on the game thread when
  * inline, on the render thread inside a frame job. */
-static void DrawSplitsExec(const GPUDrawSplit* splits, int nSplits, const GrVertex* verts, int nVerts, int shadowPass)
+/* Per-triangle view-space unit normal (x127) for the lit shaders' a_fnormal:
+ * the plane of the three view positions, the same plane the per-pixel
+ * derivative cross product reconstructed. */
+static void FillFaceNormals(GrVertex* v, int nVerts)
+{
+	for (int i = 0; i + 2 < nVerts; i += 3)
+	{
+		GrVertex* t = &v[i];
+		const float ax = t[1].vsx - t[0].vsx, ay = t[1].vsy - t[0].vsy, az = t[1].vsz - t[0].vsz;
+		const float bx = t[2].vsx - t[0].vsx, by = t[2].vsy - t[0].vsy, bz = t[2].vsz - t[0].vsz;
+		float nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+		const float l2 = nx * nx + ny * ny + nz * nz;
+		char cx = 0, cy = 0, cz = -127;
+		if (l2 > 1e-12f && l2 < 1e30f)
+		{
+			const float k = 127.0f / sqrtf(l2);
+			cx = (char)lrintf(nx * k);
+			cy = (char)lrintf(ny * k);
+			cz = (char)lrintf(nz * k);
+		}
+		t[0].fnx = t[1].fnx = t[2].fnx = cx;
+		t[0].fny = t[1].fny = t[2].fny = cy;
+		t[0].fnz = t[1].fnz = t[2].fnz = cz;
+	}
+}
+
+static void DrawSplitsExec(const GPUDrawSplit* splits, int nSplits, GrVertex* verts, int nVerts, int shadowPass)
 {
 	const unsigned long long sb1 = SPLIT_T();
 	s_execVerts = verts;
+	FillFaceNormals(verts, nVerts);
 
 	/* The casters inside the light's frustum, gathered into one buffer and
 	 * drawn with one call before the frame's own vertices go up. Every
@@ -3935,7 +3962,7 @@ static void DrawSplitsJob(void* payload)
 	GPUDrawSplit* splits = (GPUDrawSplit*)(p + h->splitOff);
 	GR_RSnapInstall(p + h->rsOff);
 	const unsigned long long bt = SPLIT_T();
-	const GrVertex* verts = Vita_BatchInto(splits, &h->nSplits, (GrVertex*)(p + h->vertOff), &h->nVerts);
+	GrVertex* verts = Vita_BatchInto(splits, &h->nSplits, (GrVertex*)(p + h->vertOff), &h->nVerts);
 	g_submitUs[0] += SPLIT_T() - bt;
 	DrawSplitsExec(&splits[1], h->nSplits, verts, h->nVerts, h->shadowPass);
 	GR_RSnapInstall(NULL);
