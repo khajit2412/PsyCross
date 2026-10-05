@@ -2237,7 +2237,10 @@ void GR_EndScene()
 	if (g_dbg_wireframeMode)
 		GR_SetWireframe(0);
 
-#if USE_OPENGL
+	/* Not on Vita: every frame job and game-thread draw binds its own array,
+	 * and as the first GL call after the world job this unbind made the game
+	 * thread wait out the whole job (8-12 ms a frame outside). */
+#if USE_OPENGL && !defined(PSYX_VITA)
 	glBindVertexArray(0);
 #endif
 }
