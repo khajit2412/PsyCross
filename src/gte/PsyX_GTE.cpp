@@ -1165,6 +1165,96 @@ int GTE_RotTransPers(int idx, int lm)
 	return h_over_sz3;
 }
 
+#if defined(__vita__)
+static inline int GTE_FA(long long a, unsigned& flag, unsigned fmax, unsigned fmin)
+{
+	if (a > 0x7ffffffffffLL) flag |= fmax;
+	if (a < -0x8000000000LL) flag |= fmin;
+	return (int)(m_sf > 0 ? (a >> 12) : (m_sf < 0 ? (a << 12) : a));
+}
+
+static inline int GTE_FL(int a, int max, int min, unsigned& flag, unsigned f)
+{
+	if (a > max) { flag |= f; return max; }
+	if (a < min) { flag |= f; return min; }
+	return a;
+}
+
+/* One colour channel of DPCS (in = C << 16) or DPCL (in = (C << 4) * IR):
+ * MAC = A(in + IR0 * Lm_B(A((FC << 12) - in), 0)). */
+static inline int GTE_FDepthCue(int in, long long fc, int ir0, unsigned& flag, unsigned fmax, unsigned fmin, unsigned fb, long long* mac3)
+{
+	const int inner = GTE_FA((fc << 12) - in, flag, fmax, fmin);
+	const int lim = GTE_FL(inner, 0x7fff, -0x8000, flag, fb);
+	const long long outer = (long long)(in + ir0 * lim);
+	if (mac3) *mac3 = outer;
+	return GTE_FA(outer, flag, fmax, fmin);
+}
+
+static int GTE_FastOp(int fn, int lm)
+{
+	unsigned flag = 0;
+	switch (fn)
+	{
+	case 0x06: /* NCLIP */
+	{
+		const int sx0 = C2_SX0, sy0 = C2_SY0, sx1 = C2_SX1, sy1 = C2_SY1, sx2 = C2_SX2, sy2 = C2_SY2;
+		const long long v = (long long)(sx0 * sy1) + (sx1 * sy2) + (sx2 * sy0) - (sx0 * sy2) - (sx1 * sy0) - (sx2 * sy1);
+		m_mac0 = v;
+		C2_MAC0 = (int)v;
+		C2_FLAG = 0;
+		return 1;
+	}
+	case 0x10: /* DPCS */
+	case 0x29: /* DPCL */
+	{
+		const int r = C2_R, g = C2_G, b = C2_B, ir0 = C2_IR0;
+		int inR, inG, inB;
+		if (fn == 0x10) { inR = r << 16; inG = g << 16; inB = b << 16; }
+		else { inR = (r << 4) * (int)C2_IR1; inG = (g << 4) * (int)C2_IR2; inB = (b << 4) * (int)C2_IR3; }
+		long long mac3 = 0;
+		const int mac1 = GTE_FDepthCue(inR, C2_RFC, ir0, flag, (1u << 31) | (1u << 30), (1u << 31) | (1u << 27), (1u << 31) | (1u << 24), NULL);
+		const int mac2 = GTE_FDepthCue(inG, C2_GFC, ir0, flag, (1u << 31) | (1u << 29), (1u << 31) | (1u << 26), (1u << 31) | (1u << 23), NULL);
+		const int macB = GTE_FDepthCue(inB, C2_BFC, ir0, flag, (1u << 31) | (1u << 28), (1u << 31) | (1u << 25), (1u << 22), &mac3);
+		m_mac3 = mac3;
+		const int irMin = lm ? 0 : -0x8000;
+		C2_MAC1 = mac1;
+		C2_MAC2 = mac2;
+		C2_MAC3 = macB;
+		C2_IR1 = GTE_FL(mac1, 0x7fff, irMin, flag, (1u << 31) | (1u << 24));
+		C2_IR2 = GTE_FL(mac2, 0x7fff, irMin, flag, (1u << 31) | (1u << 23));
+		C2_IR3 = GTE_FL(macB, 0x7fff, irMin, flag, (1u << 22));
+		C2_RGB0 = C2_RGB1;
+		C2_RGB1 = C2_RGB2;
+		C2_CD2 = C2_CODE;
+		C2_R2 = GTE_FL(mac1 >> 4, 0xff, 0, flag, (1u << 21));
+		C2_G2 = GTE_FL(mac2 >> 4, 0xff, 0, flag, (1u << 20));
+		C2_B2 = GTE_FL(macB >> 4, 0xff, 0, flag, (1u << 19));
+		C2_FLAG = flag;
+		return 1;
+	}
+	case 0x2d: /* AVSZ3 */
+	case 0x2e: /* AVSZ4 */
+	{
+		long long v;
+		if (fn == 0x2d)
+			v = (long long)(C2_ZSF3 * (int)C2_SZ1) + (C2_ZSF3 * (int)C2_SZ2) + (C2_ZSF3 * (int)C2_SZ3);
+		else
+			v = (long long)(C2_ZSF4 * (int)C2_SZ0) + (C2_ZSF4 * (int)C2_SZ1) + (C2_ZSF4 * (int)C2_SZ2) + (C2_ZSF4 * (int)C2_SZ3);
+		m_mac0 = v;
+		if (v > 0x7fffffffLL) flag |= (1u << 31) | (1u << 16);
+		if (v < -0x80000000LL) flag |= (1u << 31) | (1u << 15);
+		C2_MAC0 = (int)v;
+		C2_OTZ = GTE_FL((int)(v >> 12), 0xffff, 0, flag, (1u << 31) | (1u << 18));
+		C2_FLAG = flag;
+		return 1;
+	}
+	default:
+		return 0;
+	}
+}
+#endif
+
 int GTE_operator(int op)
 {
 #if defined(__vita__)
@@ -1188,6 +1278,14 @@ int GTE_operator(int op)
 		else if (fn == 0x30) g_vitaProfCnt[5]++;
 		else g_vitaProfCnt[6]++;
 	}
+#endif
+#if defined(__vita__)
+	/* World drawing's per-face ops (backface test, fog / lit-fog colour, depth
+	 * averages) with the same arithmetic, saturation and FLAG bits as the
+	 * cases below, in locals: those read-modify-write the registers and FLAG
+	 * in memory at every step. */
+	if (GTE_FastOp(GTE_FUNCT(gteop(op)), lm))
+		return 1;
 #endif
 	switch (GTE_FUNCT(gteop(op)))
 	{
