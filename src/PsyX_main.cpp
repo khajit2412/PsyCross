@@ -1152,16 +1152,10 @@ char PsyX_BeginScene()
 	// PC equivalent of glClear(GL_COLOR_BUFFER_BIT) at frame start.
 
 	{
-#if defined(__vita__)
-		/* With the parse worker the active environment is the parse's. */
-		const DRAWENV& de = PsyX_ParseWorkerOwnsEnv() ? g_psxGameDrawEnv : activeDrawEnv;
-#else
-		const DRAWENV& de = activeDrawEnv;
-#endif
-		const RECT16 clipenv = de.clip;
-		const u_char r = de.isbg ? de.r0 : 0;
-		const u_char g = de.isbg ? de.g0 : 0;
-		const u_char b = de.isbg ? de.b0 : 0;
+		const RECT16 clipenv = activeDrawEnv.clip;
+		const u_char r = activeDrawEnv.isbg ? activeDrawEnv.r0 : 0;
+		const u_char g = activeDrawEnv.isbg ? activeDrawEnv.g0 : 0;
+		const u_char b = activeDrawEnv.isbg ? activeDrawEnv.b0 : 0;
 		GR_Clear(clipenv.x, clipenv.y, clipenv.w, clipenv.h, r, g, b);
 	}
 
@@ -1246,9 +1240,6 @@ void PsyX_EndScene()
 	if (g_PsyX_WheelUpFrames   > 0) g_PsyX_WheelUpFrames--;
 	if (g_PsyX_WheelDownFrames > 0) g_PsyX_WheelDownFrames--;
 
-#if defined(__vita__)
-	PsyX_ParseFrameEnd();
-#endif
 	PGXP_CoverageTick();
 
 	ES_MARK(-1);
@@ -1344,7 +1335,6 @@ void PsyX_EndScene()
 		}
 		VGLR_Report(n);
 		GR_VitaShadowStatReport(n);
-		PsyX_ParseQueueReport(n);
 		if (s_drainN)
 			eprintf("[GPUDRAIN] %u samples: gpu backlog avg=%.2f max=%.2f ms, swap after drain avg=%.2f ms\n",
 			        s_drainN, s_drainUs / (double)s_drainN / 1000.0, s_drainMaxUs / 1000.0,

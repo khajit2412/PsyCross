@@ -19,17 +19,6 @@
 extern "C" int GR_NeedViewSpaceData(void);
 /* 1 = this frame draws the 3D world in perspective; see PsyX_render.cpp. */
 extern "C" int g_PsxFrame3dClass;
-#if defined(__vita__)
-/* Per-frame flags the parse reads, taken from the frame being parsed when the
- * parse worker runs it (see PsyX_ParseEnqueue). */
-extern "C" int PsyX_OnParseWorker(void);
-static int s_ptForceItem, s_ptFrame3d;
-#define PQ_FORCE_ITEM (PsyX_OnParseWorker() ? s_ptForceItem : g_PsyX_ForceItemDepth)
-#define PQ_FRAME3D    (PsyX_OnParseWorker() ? s_ptFrame3d : g_PsxFrame3dClass)
-#else
-#define PQ_FORCE_ITEM g_PsyX_ForceItemDepth
-#define PQ_FRAME3D    g_PsxFrame3dClass
-#endif
 
 #define GET_TPAGE_FORMAT(tpage) ((TexFormat)((tpage >> 7) & 0x3))
 #define GET_TPAGE_BLEND(tpage)  ((BlendMode)(((tpage >> 5) & 3) + 1))
@@ -71,24 +60,6 @@ extern "C" void PGXP_BumpGen(void) { s_pgxpGen++; }
 /* The exact-transform twin tables (PsyX_GTE.cpp) gen-stamp against this same
  * per-frame counter so they share one "clear" and never allocate. */
 extern "C" unsigned PGXP_CurGen(void) { return s_pgxpGen; }
-#if defined(__vita__)
-static volatile int s_ptStarted = 0;
-static unsigned     s_ptGen;
-/* The PGXP generation a lookup must match: the parse worker reads the frame it
- * parses, everything else the frame being built. Entries stay alive for one
- * extra generation so the frame being built cannot evict the one being parsed. */
-static inline unsigned LookGen(void)
-{
-	return (s_ptStarted && PsyX_OnParseWorker()) ? s_ptGen : s_pgxpGen;
-}
-static inline int GenStale(unsigned g)
-{
-	return s_pgxpGen - g >= 2u;
-}
-#else
-static inline unsigned LookGen(void) { return s_pgxpGen; }
-static inline int GenStale(unsigned g) { return g != s_pgxpGen; }
-#endif
 #if defined(__vita__)
 extern "C" int g_vitaShadowTest;
 #endif
@@ -162,62 +133,56 @@ static inline ShadowEntry* Sh_Scratch(uintptr_t k) {
  * table at random. Addresses past the mapped front fall back to the hash. */
 #define PKT_MAP_BYTES (1u << 20)
 #define PKT_POOL_SIZE 65536u
-static uintptr_t    s_pktBase[2];
-static uint32_t*    s_pktMap[2];
-/* One pool per buffer: the parse worker reads one buffer's frame while the
- * game fills the other. */
-static ShadowEntry* s_pktPool[2];
-static unsigned     s_pktPoolN[2], s_pktPoolGen[2];
+static uintptr_t s_pktBase[2];
+static uint32_t* s_pktMap[2];
+static ShadowEntry* s_pktPool;
+static unsigned s_pktPoolN, s_pktPoolGen;
 
 extern "C" void PsyX_SetPacketBuffers(void* buf0, void* buf1)
 {
-	for (int b = 0; b < 2; b++)
-	{
-		s_pktMap[b] = (uint32_t*)calloc(PKT_MAP_BYTES / 4, sizeof(uint32_t));
-		s_pktPool[b] = (ShadowEntry*)memalign(64, PKT_POOL_SIZE * sizeof(ShadowEntry));
-		if (!s_pktMap[b] || !s_pktPool[b])
-			return;
-		memset(s_pktPool[b], 0, PKT_POOL_SIZE * sizeof(ShadowEntry));
-	}
+	s_pktMap[0] = (uint32_t*)calloc(PKT_MAP_BYTES / 4, sizeof(uint32_t));
+	s_pktMap[1] = (uint32_t*)calloc(PKT_MAP_BYTES / 4, sizeof(uint32_t));
+	s_pktPool = (ShadowEntry*)memalign(64, PKT_POOL_SIZE * sizeof(ShadowEntry));
+	if (!s_pktMap[0] || !s_pktMap[1] || !s_pktPool)
+		return;
+	memset(s_pktPool, 0, PKT_POOL_SIZE * sizeof(ShadowEntry));
 	s_pktBase[0] = (uintptr_t)buf0;
 	s_pktBase[1] = (uintptr_t)buf1;
 }
 
-static inline uint32_t* Sh_PktMapSlot(uintptr_t k, int* buf) {
+static inline uint32_t* Sh_PktMapSlot(uintptr_t k) {
 	uintptr_t off = k - s_pktBase[0];
-	if (off < PKT_MAP_BYTES && s_pktBase[0]) { *buf = 0; return &s_pktMap[0][off >> 2]; }
+	if (off < PKT_MAP_BYTES && s_pktBase[0]) return &s_pktMap[0][off >> 2];
 	off = k - s_pktBase[1];
-	if (off < PKT_MAP_BYTES && s_pktBase[1]) { *buf = 1; return &s_pktMap[1][off >> 2]; }
+	if (off < PKT_MAP_BYTES && s_pktBase[1]) return &s_pktMap[1][off >> 2];
 	return nullptr;
 }
 
-static inline const ShadowEntry* Sh_PktFind(const uint32_t* m, int b, uintptr_t k, unsigned g) {
+static inline const ShadowEntry* Sh_PktFind(const uint32_t* m, uintptr_t k) {
 	const uint32_t v = *m;
-	if (v == 0 || s_pktPoolGen[b] != g || v > s_pktPoolN[b]) return nullptr;
-	const ShadowEntry* e = &s_pktPool[b][v - 1];
-	return (e->key == k && e->gen == g) ? e : nullptr;
+	if (v == 0 || s_pktPoolGen != s_pgxpGen) return nullptr;
+	const ShadowEntry* e = &s_pktPool[v - 1];
+	return (e->key == k && e->gen == s_pgxpGen) ? e : nullptr;
 }
 
-static inline ShadowEntry* Sh_PktSlot(uint32_t* m, int b, uintptr_t k) {
-	if (s_pktPoolGen[b] != s_pgxpGen) { s_pktPoolN[b] = 0; __sync_synchronize(); s_pktPoolGen[b] = s_pgxpGen; }
+static inline ShadowEntry* Sh_PktSlot(uint32_t* m, uintptr_t k) {
+	if (s_pktPoolGen != s_pgxpGen) { s_pktPoolGen = s_pgxpGen; s_pktPoolN = 0; }
 	const uint32_t v = *m;
-	if (v != 0 && v <= s_pktPoolN[b]) {
-		ShadowEntry* e = &s_pktPool[b][v - 1];
+	if (v != 0 && v <= s_pktPoolN) {
+		ShadowEntry* e = &s_pktPool[v - 1];
 		if (e->key == k && e->gen == s_pgxpGen) return e;
 	}
-	if (s_pktPoolN[b] >= PKT_POOL_SIZE) return nullptr;
-	ShadowEntry* e = &s_pktPool[b][s_pktPoolN[b]];
+	if (s_pktPoolN >= PKT_POOL_SIZE) return nullptr;
+	ShadowEntry* e = &s_pktPool[s_pktPoolN++];
+	*m = s_pktPoolN;
 	e->key = k; e->gen = s_pgxpGen; e->hasP = 0; e->hasV = 0;
-	s_pktPoolN[b]++;
-	*m = s_pktPoolN[b];
 	return e;
 }
 
 static ShadowEntry* Sh_SlotHash(uintptr_t k);
 static ShadowEntry* Sh_Slot(uintptr_t k) {
-	int b;
-	if (uint32_t* m = Sh_PktMapSlot(k, &b)) {
-		if (ShadowEntry* e = Sh_PktSlot(m, b, k)) return e;
+	if (uint32_t* m = Sh_PktMapSlot(k)) {
+		if (ShadowEntry* e = Sh_PktSlot(m, k)) return e;
 	}
 	return Sh_SlotHash(k);
 }
@@ -240,7 +205,7 @@ static ShadowEntry* Sh_SlotHash(uintptr_t k) {
 	ShadowEntry* e = nullptr;
 	for (int i = 0; i < 16; i++) {
 		ShadowEntry* c = &s_shadow[(s + i) & SHADOW_MASK];
-		if ((c->key == k && c->gen == s_pgxpGen) || c->key == 0 || GenStale(c->gen)) { e = c; break; }
+		if (c->key == k || c->key == 0 || c->gen != s_pgxpGen) { e = c; break; }
 	}
 	if (e == nullptr)
 		e = &s_shadow[s];   /* probe exhausted: overwrite base */
@@ -251,21 +216,19 @@ static ShadowEntry* Sh_SlotHash(uintptr_t k) {
 }
 
 static const ShadowEntry* Sh_Find(uintptr_t k) {
-	const unsigned g = LookGen();
-	int b;
-	if (const uint32_t* m = Sh_PktMapSlot(k, &b)) {
-		if (const ShadowEntry* e = Sh_PktFind(m, b, k, g)) return e;
-		if (s_pktPoolN[b] < PKT_POOL_SIZE || s_pktPoolGen[b] != g) return nullptr;
+	if (const uint32_t* m = Sh_PktMapSlot(k)) {
+		if (const ShadowEntry* e = Sh_PktFind(m, k)) return e;
+		if (s_pktPoolN < PKT_POOL_SIZE || s_pktPoolGen != s_pgxpGen) return nullptr;
 	}
 	if (const ShadowEntry* d = Sh_Scratch(k))
-		return (d->key == k && d->gen == g) ? d : nullptr;
+		return (d->key == k && d->gen == s_pgxpGen) ? d : nullptr;
 	if (s_shadow == nullptr)
 		return nullptr;
 	const unsigned s = ShadowHash(k);
 	for (int i = 0; i < 16; i++) {
 		const ShadowEntry* e = &s_shadow[(s + i) & SHADOW_MASK];
-		if (e->key == 0) return nullptr;
-		if (e->key == k && e->gen == g) return e;
+		if (e->key == 0 || e->gen != s_pgxpGen) return nullptr;
+		if (e->key == k) return e;
 	}
 	return nullptr;
 }
@@ -735,7 +698,7 @@ static void AffineStore(const void* prim, unsigned char affine, unsigned char no
 	unsigned s = (unsigned)((key >> 2) * 2654435761u) & AFFINE_MASK;
 	for (int i = 0; i < 16; i++) {
 		AffineEntry* e = &s_affine[(s + i) & AFFINE_MASK];
-		if ((e->key == key && e->gen == s_pgxpGen) || e->key == 0 || GenStale(e->gen)) {
+		if (e->key == key || e->key == 0 || e->gen != s_pgxpGen) {
 			e->key = key; e->gen = s_pgxpGen; e->affine = affine; e->noFl = noFl; return;
 		}
 	}
@@ -745,10 +708,9 @@ static void AffineStore(const void* prim, unsigned char affine, unsigned char no
 static const AffineEntry* AffineFind(const void* prim) {
 	uintptr_t key = (uintptr_t)prim;
 	unsigned s = (unsigned)((key >> 2) * 2654435761u) & AFFINE_MASK;
-	const unsigned g = LookGen();
 	for (int i = 0; i < 16; i++) {
 		const AffineEntry* e = &s_affine[(s + i) & AFFINE_MASK];
-		if (e->key == key && e->gen == g) return e;
+		if (e->key == key) return (e->gen == s_pgxpGen) ? e : nullptr;
 		if (e->key == 0) return nullptr;
 	}
 	return nullptr;
@@ -1352,8 +1314,7 @@ extern "C" void PsyX_CaptureGteDepths(void* prim)
 		/* Stale-gen slots are reclaimable (same probe rule as Shadow_Put/
 		 * AffineStore): identical placement while the memset wipes the table
 		 * (stale entries then never exist mid-probe). */
-		if (g_szTable[s].key == 0 || (g_szTable[s].key == key && g_szTable[s].gen == s_pgxpGen) ||
-		    GenStale(g_szTable[s].gen)) {
+		if (g_szTable[s].key == 0 || g_szTable[s].key == key || g_szTable[s].gen != s_pgxpGen) {
 			g_szTable[s].key = key;
 			g_szTable[s].sz[0] = s0; g_szTable[s].sz[1] = s1;
 			g_szTable[s].sz[2] = s2; g_szTable[s].sz[3] = s3;
@@ -1385,18 +1346,17 @@ static int SplitDepthForPrim(const void* prim)
 		return SPLIT_DEPTH_DISABLED;
 	uintptr_t key = (uintptr_t)prim;
 	int slot = (int)((key >> 2) & SZ_TABLE_MASK);
-	const unsigned g = LookGen();
 	for (int i = 0; i < 16; i++) {
 		int s = (slot + i) & SZ_TABLE_MASK;
 		if (g_szTable[s].key == key)
 		{
-			/* Another generation = a reused packet address from another frame:
-			 * it must not lend this prim its kind. (Function is already
-			 * PGXP-gated at entry.) */
-			if (g_szTable[s].gen != g)
+			/* Stale-gen = captured a previous frame, not this one: a reused
+			 * packet address must not inherit last frame's kind. (Function is
+			 * already PGXP-gated at entry.) */
+			if (g_szTable[s].gen != s_pgxpGen)
 			{
 				s_dbgStaleRej++;
-				continue;
+				return SPLIT_DEPTH_DISABLED;
 			}
 			if (g_szTable[s].kind == SZ_KIND_FLAT) { s_dbgSplitWorld++; return SPLIT_DEPTH_WORLD; }
 			return SPLIT_DEPTH_DISABLED;
@@ -1443,12 +1403,8 @@ extern "C" void PsyX_ClearGteDepthTable(void)
 	 * of GsDrawOt, after addPrim filled them but before DrawOTag reads them, so a
 	 * memset would wipe the current frame's entries before use. */
 	g_primPgxpForceAffine = 0;
-	g_primNoFlashlight = 0;
-#if defined(__vita__)
-	if (PsyX_ParseWorkerOwnsEnv())
-		return;
-#endif
 	s_curPgxpAffine = false;
+	g_primNoFlashlight = 0;
 	s_curNoFlashlight = false;
 }
 
@@ -1465,11 +1421,7 @@ static unsigned char PsyX_LookupGteAlpha(const void* prim)
 			 * this, a decal's fade alpha from gameplay attached itself to
 			 * whatever landed on that address later -- the load screen drew
 			 * Harry semi-transparent, ghosting over the uncleared background. */
-		{
-			if (g_szTable[s].gen == LookGen())
-				return g_szTable[s].alpha;
-			continue;
-		}
+			return (g_szTable[s].gen == s_pgxpGen) ? g_szTable[s].alpha : 255;
 		if (g_szTable[s].key == 0) break;
 	}
 	return 255;
@@ -1485,10 +1437,10 @@ static bool PsyX_LookupGteDepths(const void* prim, uint32_t* sz, unsigned char* 
 			/* Gen-validate gated on PGXP: the legacy pgxpZBuffer path (PGXP
 			 * off) keeps its exact historical behavior; when PGXP is on a
 			 * reused packet address from a prior frame reads as a miss. */
-			if (g_PsxUsePgxp && g_szTable[s].gen != LookGen())
+			if (g_PsxUsePgxp && g_szTable[s].gen != s_pgxpGen)
 			{
 				s_dbgStaleRej++;
-				continue;
+				return false;
 			}
 			sz[0] = g_szTable[s].sz[0]; sz[1] = g_szTable[s].sz[1];
 			sz[2] = g_szTable[s].sz[2]; sz[3] = g_szTable[s].sz[3];
@@ -1511,7 +1463,7 @@ static void ApplyGtePerVertexDepthImpl(GrVertex* vertex, const P_TAG* polyTag, b
 	/* Depth channel (PGXP on, outside the inventory item pass): flat per-prim
 	 * depth on the shared constant linear scale — no prev-frame normalizer
 	 * needed. Everything else keeps the legacy self-normalized behavior. */
-	const bool pgxpWorldPath = g_PsxUsePgxp && !PQ_FORCE_ITEM;
+	const bool pgxpWorldPath = g_PsxUsePgxp && !g_PsyX_ForceItemDepth;
 	if (g_PsxUsePgxp) s_dbgApplyCalls++;
 	if (!pgxpWorldPath && g_szMaxPrevFrame < 1) return;
 
@@ -1562,7 +1514,7 @@ static void ApplyGtePerVertexDepthImpl(GrVertex* vertex, const P_TAG* polyTag, b
 	 * bleed at every angle (feed-failure class). Zero lines during a repro
 	 * proves the remaining artifacts are authored crossing geometry resolved
 	 * z-nearest instead of PSX-painter (UNQC2 tray/bevel class). */
-	if (PQ_FORCE_ITEM && kind != SZ_KIND_EXACT)
+	if (g_PsyX_ForceItemDepth && kind != SZ_KIND_EXACT)
 	{
 		static int s_itemDepthNonExact = 0;
 		if (s_itemDepthNonExact < 16)
@@ -1572,7 +1524,7 @@ static void ApplyGtePerVertexDepthImpl(GrVertex* vertex, const P_TAG* polyTag, b
 		}
 	}
 
-	if (PQ_FORCE_ITEM && kind == SZ_KIND_EXACT)
+	if (g_PsyX_ForceItemDepth && kind == SZ_KIND_EXACT)
 	{
 		const float inv = 2.0f / (float)g_szMaxPrevFrame;
 		float z;
@@ -1821,7 +1773,7 @@ static void ItemProbe_RecordSplitGl(int splitIdx, int blend, int numVerts, int d
 		return;
 	ItemProbeGl& g = s_ipGl[s_ipGlCount++];
 	g.split = splitIdx; g.blend = blend; g.numVerts = numVerts; g.dfe = dfe;
-	g.forceItemDepth = PQ_FORCE_ITEM;
+	g.forceItemDepth = g_PsyX_ForceItemDepth;
 	PsyX_ItemProbe_ReadGlDepthState(&g.depthTest, &g.depthFunc, &g.depthMask, &g.depthBits,
 	                                &g.rangeNear, &g.rangeFar, &g.fbo, &g.cullFace,
 	                                &g.trackerDepthMode);
@@ -2199,7 +2151,7 @@ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* 
 	 * tree quads coming out blocky at 16x anisotropic. The lookup below still
 	 * runs and still sets the marker; this only removes the dependency on it
 	 * resolving, which it does for ~82% of vertices. */
-	if (PQ_FRAME3D && !PQ_FORCE_ITEM)
+	if (g_PsxFrame3dClass && !g_PsyX_ForceItemDepth)
 		vertex[0].geom3d = vertex[1].geom3d = vertex[2].geom3d = 1.0f;
 
 	/* Before the PGXP block: the near-clip eligibility test below reads the
@@ -2207,7 +2159,7 @@ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* 
 	 * not join the world's per-pixel flashlight (it doesn't cross the near plane,
 	 * so losing near-clip eligibility is harmless). */
 #if defined(__vita__)
-	const int wantV = GR_NeedViewSpaceData() && !PQ_FORCE_ITEM;
+	const int wantV = GR_NeedViewSpaceData() && !g_PsyX_ForceItemDepth;
 	if (wantV || g_PsxUsePgxp)
 	{
 		ShFillVertex(&vertex[0], p0, p0[0], p0[1], ofsX, ofsY, wantV, g_PsxUsePgxp);
@@ -2221,7 +2173,7 @@ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* 
 	    !PgxpNearClipEligible(vertex, 3))
 		vertex[0].ppw = vertex[1].ppw = vertex[2].ppw = 0.0f;
 #else
-	if (GR_NeedViewSpaceData() && !PQ_FORCE_ITEM)
+	if (GR_NeedViewSpaceData() && !g_PsyX_ForceItemDepth)
 	{
 		VsFillVertex(&vertex[0], p0);
 		VsFillVertex(&vertex[1], p1);
@@ -2283,7 +2235,7 @@ void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, 
 	vertex[0].z = vertex[1].z = vertex[2].z = vertex[3].z = g_otBucketDepth;
 
 	/* Frame-class 3D marker, same reasoning as MakeVertexTriangle. */
-	if (PQ_FRAME3D && !PQ_FORCE_ITEM)
+	if (g_PsxFrame3dClass && !g_PsyX_ForceItemDepth)
 	{
 		vertex[0].geom3d = vertex[1].geom3d =
 		vertex[2].geom3d = vertex[3].geom3d = 1.0f;
@@ -2293,7 +2245,7 @@ void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, 
 	 * Skipped for the isolated item model so it stays out of the world's per-pixel
 	 * flashlight (see MakeVertexTriangle). */
 #if defined(__vita__)
-	const int wantV = GR_NeedViewSpaceData() && !PQ_FORCE_ITEM;
+	const int wantV = GR_NeedViewSpaceData() && !g_PsyX_ForceItemDepth;
 	if (wantV || g_PsxUsePgxp)
 	{
 		ShFillVertex(&vertex[0], p0, p0[0], p0[1], ofsX, ofsY, wantV, g_PsxUsePgxp);
@@ -2313,7 +2265,7 @@ void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, 
 	    !PgxpNearClipEligible(vertex, 4))
 		vertex[0].ppw = vertex[1].ppw = vertex[2].ppw = vertex[3].ppw = 0.0f;
 #else
-	if (GR_NeedViewSpaceData() && !PQ_FORCE_ITEM)
+	if (GR_NeedViewSpaceData() && !g_PsyX_ForceItemDepth)
 	{
 		VsFillVertex(&vertex[0], p0);
 		VsFillVertex(&vertex[1], p1);
@@ -4160,347 +4112,6 @@ static void DrawSplitsJob(void* payload)
 	DrawSplitsExec(&splits[1], h->nSplits, verts, h->nVerts, h->shadowPass);
 	GR_RSnapInstall(NULL);
 }
-
-/* ---- Parse worker -----------------------------------------------------------
- * The PS1 GPU walked an ordering table while the CPU built the next frame, so
- * the game double-buffers its prims and only reuses a buffer two frames later.
- * The OT parse (MakeVertex, the PGXP/view-space lookups, splits) runs here on
- * its own thread the same way: DrawOTag snapshots what the parse reads, queues
- * the OT and puts a placeholder job in the render ring, which the render
- * thread runs once the worker has filled it. Ring order is kept, so GL work
- * the game records afterwards still lands after this flush. */
-extern "C" void GR_RSnapInstallWorker(const void* src);
-extern "C" void GR_RSnapWorkerSetDispEnv(const DISPENV* d);
-extern "C" int  VGLR_HelperCoreMask(void);
-extern "C" int  g_vitaParseThread = 1;
-extern "C" int  g_PsyX_SyncParseNeeded = 0;
-
-enum { PT_FREE = 0, PT_QUEUED, PT_READY };
-#define PT_COUNT 6
-struct ParseTask
-{
-	volatile int state;
-	u_long*      ot;
-	unsigned     gen;
-	int          clear;
-	int          drawEnvSet, dispEnvSet;
-	DRAWENV      drawEnv;
-	DISPENV      dispEnv;
-	int          forceItemDepth, frame3d, otViewZShift, otBucketCount;
-	char*        rs;
-	char*        buf;
-	size_t       cap, used;
-	SceUID       ready;
-};
-static ParseTask       s_pt[PT_COUNT];
-static unsigned        s_ptHead, s_ptTail;   /* queued by the game / finished by the worker */
-static volatile unsigned s_ptDone;
-static SceUID          s_ptWake = -1, s_ptIdle = -1;
-static uint32_t        s_ptTls;
-static SceUID          s_ptTid = -1;
-static int             s_ptTlsUnique = 0;
-static ParseTask*      s_ptCur;
-/* Palette textures the worker could not find; built on the game thread while
- * the worker is idle. */
-#define PT_PALMISS 64
-static int             s_ptPalMiss[PT_PALMISS];
-static volatile int    s_ptPalMissN;
-/* [PARSEQ] */
-static unsigned long long s_pqWorkUs, s_pqFenceUs, s_pqSlotUs, s_pqRenderWaitUs;
-static unsigned        s_pqTasks, s_pqFences, s_pqSync;
-static const char*     s_pqFenceWho[8];
-static unsigned long long s_pqFenceWhoUs[8];
-
-static inline uint32_t PT_Tls(void)
-{
-	uint32_t v;
-	__asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(v));
-	return v;
-}
-
-extern "C" int PsyX_OnParseWorker(void)
-{
-	if (!s_ptStarted)
-		return 0;
-	return s_ptTlsUnique ? (PT_Tls() == s_ptTls) : (sceKernelGetThreadId() == s_ptTid);
-}
-
-static char* ParseTaskAlloc(size_t bytes)
-{
-	ParseTask* t = s_ptCur;
-	const size_t need = t->used + 8 + ((bytes + 7) & ~(size_t)7);
-	if (need > t->cap)
-	{
-		size_t cap = t->cap ? t->cap : (1u << 20);
-		while (cap < need) cap *= 2;
-		char* nb = (char*)memalign(64, cap);
-		if (!nb)
-			return nullptr;
-		if (t->used)
-			memcpy(nb, t->buf, t->used);
-		free(t->buf);
-		t->buf = nb;
-		t->cap = cap;
-	}
-	char* rec = t->buf + t->used;
-	*(uint32_t*)rec = (uint32_t)((bytes + 7) & ~(size_t)7);
-	t->used = need;
-	return rec + 8;
-}
-
-static void ParseRun(ParseTask* t)
-{
-	const unsigned long long t0 = SPLIT_T();
-	s_ptCur = t;
-	s_ptGen = t->gen;
-	s_ptForceItem = t->forceItemDepth;
-	s_ptFrame3d = t->frame3d;
-	t->used = 0;
-	if (t->drawEnvSet)
-		activeDrawEnv = t->drawEnv;
-	if (t->dispEnvSet)
-		activeDispEnv = t->dispEnv;
-	GR_RSnapInstallWorker(t->rs);
-	GR_RSnapWorkerSetDispEnv(&activeDispEnv);
-	if (t->clear)
-		ClearSplits();
-
-	ParsePrimitivesLinkedList(t->ot, 0);
-	DrawAllSplits();
-
-	GR_RSnapInstallWorker(nullptr);
-	s_ptCur = nullptr;
-	s_pqWorkUs += SPLIT_T() - t0;
-	__sync_synchronize();
-	t->state = PT_READY;
-	sceKernelSignalSema(t->ready, 1);
-}
-
-static int ParseWorkerMain(SceSize args, void* argp)
-{
-	(void)args; (void)argp;
-	s_ptTls = PT_Tls();
-	s_ptTid = sceKernelGetThreadId();
-	__sync_synchronize();
-	for (;;)
-	{
-		sceKernelWaitSema(s_ptWake, 1, NULL);
-		ParseTask* t = &s_pt[s_ptTail % PT_COUNT];
-		ParseRun(t);
-		s_ptTail++;
-		__sync_synchronize();
-		s_ptDone = s_ptTail;
-		sceKernelSignalSema(s_ptIdle, 1);
-	}
-	return 0;
-}
-
-static void ParseWorkerStart(void)
-{
-	static int s_tried = 0;
-	if (s_tried)
-		return;
-	s_tried = 1;
-	const int rsBytes = GR_RSnapSize();
-	for (int i = 0; i < PT_COUNT; i++)
-	{
-		s_pt[i].rs = (char*)malloc((size_t)rsBytes);
-		s_pt[i].ready = sceKernelCreateSema("parseReady", 0, 0, 1, NULL);
-		if (!s_pt[i].rs || s_pt[i].ready < 0)
-			return;
-	}
-	s_ptWake = sceKernelCreateSema("parseWake", 0, 0, PT_COUNT, NULL);
-	s_ptIdle = sceKernelCreateSema("parseIdle", 0, 0, 1 << 20, NULL);
-	if (s_ptWake < 0 || s_ptIdle < 0)
-		return;
-	/* Core 2 beside the timer, audio and vitaGL GC: cores 0 and 1 are the game
-	 * and render threads, core 3 exists only with a plugin. */
-	SceUID th = sceKernelCreateThread("psxParse", ParseWorkerMain, 0x10000100, 256 * 1024,
-	                                  0, VGLR_HelperCoreMask(), NULL);
-	if (th < 0 || sceKernelStartThread(th, 0, NULL) < 0)
-		return;
-	while (s_ptTid < 0)
-		sceKernelDelayThread(100);
-	s_ptTlsUnique = s_ptTls != PT_Tls();
-	__sync_synchronize();
-	s_ptStarted = 1;
-	eprintf("[PARSEQ] worker started on core 2 (thread check: %s)\n", s_ptTlsUnique ? "TPIDRURO" : "thread id");
-}
-
-/* Waits until the worker has finished every queued OT. `who` names the call
- * site for [PARSEQ]. */
-extern "C" void PsyX_ParseFenceAt(const char* who)
-{
-	if (!s_ptStarted || s_ptDone == s_ptHead || PsyX_OnParseWorker())
-		return;
-	const unsigned long long t0 = SPLIT_T();
-	while (s_ptDone != s_ptHead)
-		sceKernelWaitSema(s_ptIdle, 1, NULL);
-	const unsigned long long us = SPLIT_T() - t0;
-	s_pqFenceUs += us;
-	s_pqFences++;
-	for (int i = 0; i < 8; i++)
-	{
-		if (s_pqFenceWho[i] == who || !s_pqFenceWho[i])
-		{
-			s_pqFenceWho[i] = who;
-			s_pqFenceWhoUs[i] += us;
-			break;
-		}
-	}
-}
-
-/* The game refills a packet buffer only after the worker has parsed every OT
- * built in it (the PS1's DrawSync before reusing prims). Marks are the queue
- * position after the last OT enqueued from each buffer. */
-static unsigned s_ptBufMark[2];
-static int      s_ptCurBuf = 0;
-
-extern "C" void PsyX_ParseFrameEnd(void)
-{
-	g_PsyX_SyncParseNeeded = 0;
-}
-
-extern "C" void PsyX_ParseFenceBuffer(int buf)
-{
-	buf &= 1;
-	if (s_ptStarted && !PsyX_OnParseWorker() && (int)(s_ptDone - s_ptBufMark[buf]) < 0)
-	{
-		const unsigned long long t0 = SPLIT_T();
-		while ((int)(s_ptDone - s_ptBufMark[buf]) < 0)
-			sceKernelWaitSema(s_ptIdle, 1, NULL);
-		s_pqFenceUs += SPLIT_T() - t0;
-		s_pqFences++;
-	}
-	s_ptCurBuf = buf;
-}
-
-extern "C" void PsyX_ParseFence(void)
-{
-	PsyX_ParseFenceAt("other");
-}
-
-static void ParseDeferredJob(void* payload)
-{
-	ParseTask* t = *(ParseTask**)payload;
-	if (t->state != PT_READY)
-	{
-		const unsigned long long t0 = SPLIT_T();
-		while (t->state != PT_READY)
-			sceKernelWaitSema(t->ready, 1, NULL);
-		s_pqRenderWaitUs += SPLIT_T() - t0;
-	}
-	__sync_synchronize();
-	size_t off = 0;
-	while (off < t->used)
-	{
-		const uint32_t sz = *(uint32_t*)(t->buf + off);
-		DrawSplitsJob(t->buf + off + 8);
-		off += 8 + sz;
-	}
-	__sync_synchronize();
-	t->state = PT_FREE;
-}
-
-/* While on, the worker may be using the active draw/display environments, so
- * the game's PutDrawEnv/PutDispEnv only record theirs (g_psxGame*Env). */
-static int s_ptModeOn = 0;
-
-extern "C" int PsyX_ParseWorkerOwnsEnv(void)
-{
-	return s_ptModeOn;
-}
-
-/* Whether DrawOTag hands this OT to the worker. */
-extern "C" int PsyX_ParseAsync(void)
-{
-	const int want = g_vitaParseThread && VGLR_JobsEnabled() && g_PsxUsePgxp;
-	if (want && !s_ptStarted)
-		ParseWorkerStart();
-	if (!want || !s_ptStarted)
-	{
-		if (s_ptModeOn)
-		{
-			PsyX_ParseFenceAt("worker off");
-			s_ptModeOn = 0;
-		}
-		return 0;
-	}
-	s_ptModeOn = 1;
-	return !g_PsyX_SyncParseNeeded && !g_dbg_emulatorPaused;
-}
-
-extern "C" void PsyX_ParseEnqueue(u_long* ot, int clear)
-{
-	extern int g_PsxFrame3dClass;
-	/* Palette misses from earlier flushes: build them while the worker is
-	 * idle (it reads the cache) so the next frames find them. */
-	if (s_ptPalMissN && s_ptDone == s_ptHead)
-	{
-		GR_VitaPaletteTextureBuild(s_ptPalMiss, s_ptPalMissN);
-		s_ptPalMissN = 0;
-	}
-
-	ParseTask* t = &s_pt[s_ptHead % PT_COUNT];
-	if (t->state != PT_FREE)
-	{
-		const unsigned long long t0 = SPLIT_T();
-		while (t->state != PT_FREE)
-			sceKernelDelayThread(50);
-		s_pqSlotUs += SPLIT_T() - t0;
-	}
-	t->ot = ot;
-	t->gen = s_pgxpGen;
-	t->clear = clear;
-	t->drawEnvSet = g_psxGameDrawEnvDirty;
-	t->dispEnvSet = g_psxGameDispEnvDirty;
-	if (t->drawEnvSet) t->drawEnv = g_psxGameDrawEnv;
-	if (t->dispEnvSet) t->dispEnv = g_psxGameDispEnv;
-	g_psxGameDrawEnvDirty = g_psxGameDispEnvDirty = 0;
-	t->forceItemDepth = g_PsyX_ForceItemDepth;
-	t->frame3d = g_PsxFrame3dClass;
-	t->otViewZShift = s_otViewZShift;
-	t->otBucketCount = g_currentOTBucketCount;
-	GR_RSnapCapture(t->rs);
-	t->state = PT_QUEUED;
-
-	void* p = VGLR_JobBegin(ParseDeferredJob, sizeof(ParseTask*));
-	if (!p)
-	{
-		t->state = PT_FREE;
-		return;
-	}
-	*(ParseTask**)p = t;
-	__sync_synchronize();
-	s_ptHead++;
-	s_ptBufMark[s_ptCurBuf] = s_ptHead;
-	sceKernelSignalSema(s_ptWake, 1);
-	VGLR_JobEnd();
-	s_pqTasks++;
-}
-
-extern "C" void PsyX_ParseQueueReport(double frames)
-{
-	if (!s_ptStarted || frames <= 0.0)
-		return;
-	eprintf("[PARSEQ] per frame: OTs=%.2f worker=%.2f ms, game waits: fence=%.2f ms (%.2f/frame) slot=%.2f ms, render waited %.2f ms, sync OTs=%.2f\n",
-	        s_pqTasks / frames, s_pqWorkUs / frames / 1000.0, s_pqFenceUs / frames / 1000.0,
-	        s_pqFences / frames, s_pqSlotUs / frames / 1000.0, s_pqRenderWaitUs / frames / 1000.0,
-	        s_pqSync / frames);
-	for (int i = 0; i < 8 && s_pqFenceWho[i]; i++)
-	{
-		eprintf("[PARSEQ]   fence %s: %.2f ms/frame\n", s_pqFenceWho[i], s_pqFenceWhoUs[i] / frames / 1000.0);
-		s_pqFenceWhoUs[i] = 0;
-		s_pqFenceWho[i] = nullptr;
-	}
-	s_pqWorkUs = s_pqFenceUs = s_pqSlotUs = s_pqRenderWaitUs = 0;
-	s_pqTasks = s_pqFences = s_pqSync = 0;
-}
-
-extern "C" void PsyX_ParseNoteSync(void)
-{
-	s_pqSync++;
-}
 #endif
 
 //
@@ -4538,29 +4149,14 @@ void DrawAllSplits()
 	const unsigned long long sb0 = SPLIT_T();
 	s_drawVerts = g_vertexBuffer;
 
-	const int onWorker = PsyX_OnParseWorker();
 	int inlineOnly = !VGLR_JobsEnabled();
 	for (int i = 1; i <= g_splitIndex; i++)
 	{
 		GPUDrawSplit& s = g_splits[i];
 		if (s.kind != GPU_SPLIT_LEGACY)
-			inlineOnly |= !onWorker;
+			inlineOnly = 1;
 		else if (s.palKey)
-		{
-			if (!onWorker)
-				s.palTex = GR_VitaPaletteTexture(s.palKey, &s.palOpaque);
-			else if (!(s.palTex = GR_VitaPaletteTextureFind(s.palKey, &s.palOpaque)))
-			{
-				int k, n = s_ptPalMissN;
-				for (k = 0; k < n && s_ptPalMiss[k] != s.palKey; k++) {}
-				if (k == n && n < PT_PALMISS)
-				{
-					s_ptPalMiss[n] = s.palKey;
-					__sync_synchronize();
-					s_ptPalMissN = n + 1;
-				}
-			}
-		}
+			s.palTex = GR_VitaPaletteTexture(s.palKey, &s.palOpaque);
 	}
 
 	/* The shadow-map decision stays here: it keeps state across frames and
@@ -4610,8 +4206,7 @@ void DrawAllSplits()
 		const size_t rsBytes    = ((size_t)GR_RSnapSize() + 7) & ~(size_t)7;
 		const size_t splitBytes = ((size_t)(g_splitIndex + 1) * sizeof(GPUDrawSplit) + 7) & ~(size_t)7;
 		const size_t vertBytes  = (size_t)g_vertexIndex * sizeof(GrVertex);
-		char* p = onWorker ? ParseTaskAlloc(hdrBytes + rsBytes + splitBytes + vertBytes)
-		                   : (char*)VGLR_JobBegin(DrawSplitsJob, hdrBytes + rsBytes + splitBytes + vertBytes);
+		char* p = (char*)VGLR_JobBegin(DrawSplitsJob, hdrBytes + rsBytes + splitBytes + vertBytes);
 		if (p)
 		{
 			DrawJobHdr* h = (DrawJobHdr*)p;
@@ -4624,19 +4219,13 @@ void DrawAllSplits()
 			GR_RSnapCapture(p + h->rsOff);
 			memcpy(p + h->splitOff, &g_splits[0], (size_t)(g_splitIndex + 1) * sizeof(GPUDrawSplit));
 			memcpy(p + h->vertOff, s_drawVerts, vertBytes);
-			if (!onWorker)
-				VGLR_JobEnd();
+			VGLR_JobEnd();
 			g_vitaFrameJobs[0]++;
 			ClearSplits();
 			return;
 		}
 	}
 
-	if (onWorker)
-	{
-		ClearSplits();
-		return;
-	}
 	/* Inline: the renderer caches and vertex buffers may still be in use by a
 	 * job from an earlier flush. */
 	VGLR_JobFence();
@@ -4709,16 +4298,8 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 		// one depth value — matching the PSX's painter's-algorithm intent.
 		// g_otBucketDepth advances only at tagLength==0 bucket-boundary entries.
 		int otBucketIdx = 0;
-#if defined(__vita__)
-		/* The game sets both for its next OT while the worker parses this one. */
-		const int otBucketCount = (s_ptCur && PsyX_OnParseWorker()) ? s_ptCur->otBucketCount : g_currentOTBucketCount;
-		const int otViewZShift  = (s_ptCur && PsyX_OnParseWorker()) ? s_ptCur->otViewZShift : s_otViewZShift;
-#else
-		const int otBucketCount = g_currentOTBucketCount;
-		const int otViewZShift  = s_otViewZShift;
-#endif
-		const float otBucketStep = (otBucketCount > 1)
-			? (2.0f / (float)(otBucketCount - 1)) : 0.0f;
+		const float otBucketStep = (g_currentOTBucketCount > 1)
+			? (2.0f / (float)(g_currentOTBucketCount - 1)) : 0.0f;
 		g_otBucketDepth = -1.0f;
 		// walk OT_TAG linked list with safety guards
 		uintptr_t basePacket = reinterpret_cast<uintptr_t>(p);
@@ -4798,7 +4379,7 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 			else if (tagLength == 0)
 			{
 				// OT bucket boundary — advance to the next bucket's depth.
-				if (g_PsxUsePgxp && otViewZShift > 0)
+				if (g_PsxUsePgxp && s_otViewZShift > 0)
 				{
 					/* Depth channel: seed the bucket on the SAME constant
 					 * linear viewZ scale the world/EXACT prims use, so
@@ -4809,10 +4390,10 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 					 * covers viewZ ~ index << shiftEff (+half a quantum to
 					 * center it). Monotone in walk order, exactly like the
 					 * legacy index seed — today's relations are preserved. */
-					int b = otBucketCount - 1 - otBucketIdx;
+					int b = g_currentOTBucketCount - 1 - otBucketIdx;
 					if (b < 0) b = 0;
-					float vz = (float)((unsigned)b << otViewZShift)
-					         + 0.5f * (float)(1 << otViewZShift);
+					float vz = (float)((unsigned)b << s_otViewZShift)
+					         + 0.5f * (float)(1 << s_otViewZShift);
 					g_otBucketDepth = PgxpNdcFromViewZ(vz);
 				}
 				else
@@ -5288,9 +4869,8 @@ static inline void ParsePrefetch(const P_TAG* tag, const short* const* xy, int n
 	for (int i = 0; i < n; i++)
 	{
 		const uintptr_t k = (uintptr_t)xy[i];
-		int b;
-		if (const uint32_t* m = Sh_PktMapSlot(k, &b)) {
-			if (*m && *m <= PKT_POOL_SIZE) __builtin_prefetch(&s_pktPool[b][*m - 1]);
+		if (const uint32_t* m = Sh_PktMapSlot(k)) {
+			if (*m) __builtin_prefetch(&s_pktPool[*m - 1]);
 		} else if (k - (uintptr_t)g_PsxScratchpad >= sizeof(g_PsxScratchpad))
 			__builtin_prefetch(&s_shadow[ShadowHash(k)]);
 	}
