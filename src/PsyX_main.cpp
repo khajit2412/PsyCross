@@ -237,8 +237,7 @@ int PsyX_Sys_GetVBlankCount()
 int intrThreadMain(void* data)
 {
 #if defined(__vita__)
-	/* Core 3 with a core-unlock plugin, else core 2: the game thread owns core 0
-	 * and the render thread core 1. */
+	/* Core 2: the game thread owns core 0 and the render thread core 1. */
 	sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), VGLR_HelperCoreMask());
 #endif
 	timerCtx_t rcnt2Timer;

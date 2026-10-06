@@ -1106,8 +1106,8 @@ int _eCdSpoolerThreadFunc(void* data)
 {
 #if defined(__vita__)
 	/* Core 3 with a core-unlock plugin, else core 2: away from the game and
-	 * render threads (cores 0 and 1). */
-	sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), VGLR_HelperCoreMask());
+	 * render threads (cores 0 and 1) and the timing-critical helpers. */
+	sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), VGLR_SpareCoreMask());
 #endif
 	//Print incoming data
 	eprintwarn("Running CD thread...\n");
