@@ -759,6 +759,44 @@ static inline void VsFillVertex(GrVertex* v, const void* addr)
 	if (s_curNoFlashlight) v->vsz = -1.0f;
 }
 
+#if defined(__vita__)
+/* Both halves of a vertex word's shadow sit in one entry on Vita, so the
+ * view-space and PGXP fills share one lookup instead of probing twice. */
+static inline void ShFillVertex(GrVertex* v, const void* addr, int rawX, int rawY,
+                                float ofsX, float ofsY, int wantV, int wantP)
+{
+	const ShadowEntry* e = Sh_Find((uintptr_t)addr);
+	const unsigned value = *(const unsigned*)addr;
+	if (wantV)
+	{
+		if (e && e->hasV && e->vvalue == value) {
+			v->vsx = e->vx; v->vsy = e->vy; v->vsz = e->vz; v->nx = e->nocast; v->ny = 1.0f;
+			v->nz = e->fade;
+			s_curPolyOfx = e->ofx; s_curPolyOfy = e->ofy; s_curPolyH = e->h;
+			s_curPolyProjValid = 1;
+		}
+		if (s_curNoFlashlight) v->vsz = -1.0f;
+	}
+	if (!wantP)
+		return;
+	if (s_curPgxpAffine) {
+		v->ppx = (float)v->x; v->ppy = (float)v->y; v->ppw = 0.0f; s_pgxpMiss++; return;
+	}
+	if (e && e->hasP && e->value == value && e->w > 0.0f) {
+		const float m = g_PgxpEdgeMax;
+		if (e->x < -m || e->x > m || e->y < -m || e->y > m) {
+			s_pgxpClamp++;
+		} else {
+			float ox = e->x + ofsX, oy = e->y + ofsY, ow = e->w;
+			WeldVertex(&ox, &oy, &ow);
+			v->ppx = ox; v->ppy = oy; v->ppw = ow; s_pgxpDet++;
+			return;
+		}
+	}
+	v->ppx = (float)rawX + ofsX; v->ppy = (float)rawY + ofsY; v->ppw = 0.0f; s_pgxpMiss++;
+}
+#endif
+
 /* True when the near clipper will take this poly: every vertex carries a
  * validated view-space entry (ny marker) and the poly straddles the near plane.
  * MakeVertexTriangle/Quad consult this to keep per-vertex precise data intact —
@@ -2052,6 +2090,21 @@ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* 
 	 * view-space data these fill. Skipped for the isolated item model — it must
 	 * not join the world's per-pixel flashlight (it doesn't cross the near plane,
 	 * so losing near-clip eligibility is harmless). */
+#if defined(__vita__)
+	const int wantV = GR_NeedViewSpaceData() && !g_PsyX_ForceItemDepth;
+	if (wantV || g_PsxUsePgxp)
+	{
+		ShFillVertex(&vertex[0], p0, p0[0], p0[1], ofsX, ofsY, wantV, g_PsxUsePgxp);
+		ShFillVertex(&vertex[1], p1, p1[0], p1[1], ofsX, ofsY, wantV, g_PsxUsePgxp);
+		ShFillVertex(&vertex[2], p2, p2[0], p2[1], ofsX, ofsY, wantV, g_PsxUsePgxp);
+	}
+	if (wantV && (vertex[0].ny > 0.5f || vertex[1].ny > 0.5f || vertex[2].ny > 0.5f))
+		vertex[0].geom3d = vertex[1].geom3d = vertex[2].geom3d = 1.0f;
+	if (g_PsxUsePgxp &&
+	    (vertex[0].ppw <= 0.0f || vertex[1].ppw <= 0.0f || vertex[2].ppw <= 0.0f) &&
+	    !PgxpNearClipEligible(vertex, 3))
+		vertex[0].ppw = vertex[1].ppw = vertex[2].ppw = 0.0f;
+#else
 	if (GR_NeedViewSpaceData() && !g_PsyX_ForceItemDepth)
 	{
 		VsFillVertex(&vertex[0], p0);
@@ -2082,6 +2135,7 @@ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* 
 		    !PgxpNearClipEligible(vertex, 3))
 			vertex[0].ppw = vertex[1].ppw = vertex[2].ppw = 0.0f;
 	}
+#endif
 
 	ScreenCoordsToEmulator(vertex, 3);
 }
@@ -2122,6 +2176,27 @@ void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, 
 	/* Before the PGXP block: near-clip eligibility reads the view-space data.
 	 * Skipped for the isolated item model so it stays out of the world's per-pixel
 	 * flashlight (see MakeVertexTriangle). */
+#if defined(__vita__)
+	const int wantV = GR_NeedViewSpaceData() && !g_PsyX_ForceItemDepth;
+	if (wantV || g_PsxUsePgxp)
+	{
+		ShFillVertex(&vertex[0], p0, p0[0], p0[1], ofsX, ofsY, wantV, g_PsxUsePgxp);
+		ShFillVertex(&vertex[1], p1, p1[0], p1[1], ofsX, ofsY, wantV, g_PsxUsePgxp);
+		ShFillVertex(&vertex[2], p2, p2[0], p2[1], ofsX, ofsY, wantV, g_PsxUsePgxp);
+		ShFillVertex(&vertex[3], p3, p3[0], p3[1], ofsX, ofsY, wantV, g_PsxUsePgxp);
+	}
+	if (wantV && (vertex[0].ny > 0.5f || vertex[1].ny > 0.5f ||
+	              vertex[2].ny > 0.5f || vertex[3].ny > 0.5f))
+	{
+		vertex[0].geom3d = vertex[1].geom3d =
+		vertex[2].geom3d = vertex[3].geom3d = 1.0f;
+	}
+	if (g_PsxUsePgxp &&
+	    (vertex[0].ppw <= 0.0f || vertex[1].ppw <= 0.0f ||
+	     vertex[2].ppw <= 0.0f || vertex[3].ppw <= 0.0f) &&
+	    !PgxpNearClipEligible(vertex, 4))
+		vertex[0].ppw = vertex[1].ppw = vertex[2].ppw = vertex[3].ppw = 0.0f;
+#else
 	if (GR_NeedViewSpaceData() && !g_PsyX_ForceItemDepth)
 	{
 		VsFillVertex(&vertex[0], p0);
@@ -2151,6 +2226,7 @@ void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, 
 		    !PgxpNearClipEligible(vertex, 4))
 			vertex[0].ppw = vertex[1].ppw = vertex[2].ppw = vertex[3].ppw = 0.0f;
 	}
+#endif
 
 	ScreenCoordsToEmulator(vertex, 4);
 }
@@ -4680,8 +4756,23 @@ static int ProcessFlatPoly(P_TAG* polyTag)
 	return 0;
 }
 
+#if defined(__vita__)
+/* [PARSEPROF]: where a textured world prim's parse time goes, timed on one
+ * prim in eight (the clock read is a syscall). */
+extern "C" { unsigned long long g_vitaParseProf[8]; unsigned g_vitaParseProfN; }
+static unsigned s_ppTick;
+#define PP_BEGIN() const int _pp = ((++s_ppTick & 7) == 0); unsigned long long _pt = _pp ? SPLIT_T() : 0ULL
+#define PP_MARK(i) do { if (_pp) { const unsigned long long _n = SPLIT_T(); g_vitaParseProf[i] += _n - _pt; _pt = _n; } } while (0)
+#define PP_DONE() do { PP_MARK(6); if (_pp) g_vitaParseProfN++; } while (0)
+#else
+#define PP_BEGIN() ((void)0)
+#define PP_MARK(i) ((void)0)
+#define PP_DONE() ((void)0)
+#endif
+
 static int ProcessGouraudPoly(P_TAG* polyTag)
 {
+	PP_BEGIN();
 	/* PGXP hint (3D polygons only). 0xFFFF / ignored when PGXP off. */
 	const u_short gteIndex = g_PsxUsePgxp ? polyTag->pgxp_index : (u_short)0xFFFF;
 	if (g_PsxUsePgxp) PGXP_BeginPrim(polyTag);
@@ -4725,12 +4816,17 @@ static int ProcessGouraudPoly(P_TAG* polyTag)
 		{
 			ApplyHiresOverride(poly->tpage, poly->clut);
 
+			PP_MARK(0);
 			AddSplit(semiTrans, true, SplitDepthForPrim(polyTag));
+			PP_MARK(1);
 
 			GrVertex* firstVertex = &g_vertexBuffer[g_vertexIndex];
 			MakeVertexTriangle(firstVertex, &poly->x0, &poly->x1, &poly->x2, gteIndex);
+			PP_MARK(2);
 			ApplyGtePerVertexDepth(firstVertex, polyTag, false);
+			PP_MARK(3);
 			MakeTexcoordTriangle(firstVertex, &poly->u0, &poly->u1, &poly->u2, poly->tpage, poly->clut, GET_TPAGE_DITHER(activeDrawEnv.tpage) || activeDrawEnv.dtd);
+			PP_MARK(4);
 			MakeColourTriangle(firstVertex, shadeTexOn, &poly->r0, &poly->r1, &poly->r2);
 
 			/* Per-vertex fog. v1 and v2 ride their colour-word pad; v0's pad IS
@@ -4749,7 +4845,9 @@ static int ProcessGouraudPoly(P_TAG* polyTag)
 			firstVertex[1]._p0 = poly->p1;  // v1
 			firstVertex[2]._p0 = poly->p2;  // v2
 
+			PP_MARK(5);
 			g_vertexIndex += PgxpEmitPoly(firstVertex, 3);
+			PP_DONE();
 
 #if defined(DEBUG_POLY_COUNT)
 			polygon_count++;
@@ -4792,12 +4890,17 @@ static int ProcessGouraudPoly(P_TAG* polyTag)
 		{
 			ApplyHiresOverride(poly->tpage, poly->clut);
 
+			PP_MARK(0);
 			AddSplit(semiTrans, true, SplitDepthForPrim(polyTag));
+			PP_MARK(1);
 
 			GrVertex* firstVertex = &g_vertexBuffer[g_vertexIndex];
 			MakeVertexQuad(firstVertex, &poly->x0, &poly->x1, &poly->x3, &poly->x2, gteIndex);
+			PP_MARK(2);
 			ApplyGtePerVertexDepth(firstVertex, polyTag, true);
+			PP_MARK(3);
 			MakeTexcoordQuad(firstVertex, &poly->u0, &poly->u1, &poly->u3, &poly->u2, poly->tpage, poly->clut, GET_TPAGE_DITHER(activeDrawEnv.tpage) || activeDrawEnv.dtd);
+			PP_MARK(4);
 			MakeColourQuad(firstVertex, shadeTexOn, &poly->r0, &poly->r1, &poly->r3, &poly->r2);
 
 			// Copy per-vertex fog factor from pad bytes (note: MakeColourQuad swaps v2/v3)
@@ -4808,7 +4911,9 @@ static int ProcessGouraudPoly(P_TAG* polyTag)
 
 			TriangulateQuad();
 
+			PP_MARK(5);
 			g_vertexIndex += PgxpEmitPoly(firstVertex, 6);
+			PP_DONE();
 
 #if defined(DEBUG_POLY_COUNT)
 			polygon_count++;

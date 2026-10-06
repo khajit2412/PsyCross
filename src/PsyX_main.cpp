@@ -1195,6 +1195,9 @@ extern "C" void GR_VitaShadowStatReport(double frames);
 extern "C" unsigned long long g_vitaProfUs[4];
 extern "C" unsigned long long g_vitaProfUnlit[4];
 extern "C" unsigned g_vitaProfCnt[8];
+extern "C" unsigned long long g_vitaProfUnlit[4];
+extern "C" unsigned long long g_vitaParseProf[8];
+extern "C" unsigned g_vitaParseProfN;
 extern "C" unsigned g_splitCause[8];
 extern "C" unsigned g_vitaPalCacheStats[3];
 extern "C" int g_vitaPalCache;
@@ -1369,6 +1372,20 @@ void PsyX_EndScene()
 			        g_vitaProfCnt[0] / n, g_vitaProfCnt[1] / n, g_vitaProfCnt[2] / n, g_vitaProfCnt[3] / n);
 			eprintf("[WORLDPROF] gte per frame: rtps=%.0f rtpt=%.0f other=%.0f\n",
 			        g_vitaProfCnt[4] / n, g_vitaProfCnt[5] / n, g_vitaProfCnt[6] / n);
+			eprintf("[WORLDPROF] unlit ms/frame: copy=%.2f light=%.2f transform=%.2f meshDraw=%.2f\n",
+			        g_vitaProfUnlit[0] / n / 1000.0, g_vitaProfUnlit[1] / n / 1000.0,
+			        g_vitaProfUnlit[2] / n / 1000.0, g_vitaProfUnlit[3] / n / 1000.0);
+			if (g_vitaParseProfN)
+			{
+				const double k = 1.0 / g_vitaParseProfN;
+				eprintf("[PARSEPROF] us/prim (textured world prims, %.0f/frame): clut+hires=%.2f addSplit=%.2f vertex=%.2f depth=%.2f texcoord=%.2f colour=%.2f emit=%.2f\n",
+				        g_vitaParseProfN * 8.0 / n,
+				        g_vitaParseProf[0] * k, g_vitaParseProf[1] * k, g_vitaParseProf[2] * k, g_vitaParseProf[3] * k,
+				        g_vitaParseProf[4] * k, g_vitaParseProf[5] * k, g_vitaParseProf[6] * k);
+			}
+			memset(g_vitaProfUnlit, 0, sizeof(g_vitaProfUnlit));
+			memset(g_vitaParseProf, 0, sizeof(g_vitaParseProf));
+			g_vitaParseProfN = 0;
 			memset(g_vitaProfUs, 0, sizeof(g_vitaProfUs));
 			memset(g_vitaProfCnt, 0, sizeof(g_vitaProfCnt));
 			eprintf("[SPLITCAUSE] per frame: blend=%.1f format=%.1f texture=%.1f depth=%.1f primMode=%.1f clip=%.1f dfe=%.1f other=%.1f\n",
