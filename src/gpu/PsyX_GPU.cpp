@@ -60,6 +60,9 @@ extern "C" void PGXP_BumpGen(void) { s_pgxpGen++; }
 /* The exact-transform twin tables (PsyX_GTE.cpp) gen-stamp against this same
  * per-frame counter so they share one "clear" and never allocate. */
 extern "C" unsigned PGXP_CurGen(void) { return s_pgxpGen; }
+#if defined(__vita__)
+extern "C" int g_vitaShadowTest;
+#endif
 
 /* Shadow entry: precise projection of the word at `key`. value = the packed
  * integer (s16 x | s16 y<<16) that lives at key; a draw that reused the address
@@ -4093,6 +4096,21 @@ void DrawAllSplits()
 	/* The shadow-map decision stays here: it keeps state across frames and
 	 * builds the light matrix the job's snapshot then carries. */
 	int shadowPass = 0;
+#if defined(__vita__)
+	{
+		extern int g_PsyX_UsePerPixelFlashlight, g_PsyX_FlashlightStyle, g_PsyX_UseFlashlightShadows;
+		static int s_modePrev = -1;
+		const int mode = g_vitaShadowTest | (g_PsyX_UsePerPixelFlashlight << 2) |
+		                 (g_PsyX_FlashlightStyle << 3) | (g_PsyX_UseFlashlightShadows << 4);
+		if (mode != s_modePrev)
+		{
+			s_modePrev = mode;
+			eprintf("[SHADOWTEST] test=%d perPixel=%d style=%s shadows=%d\n", g_vitaShadowTest,
+			        g_PsyX_UsePerPixelFlashlight, g_PsyX_FlashlightStyle ? "classic" : "modern",
+			        g_PsyX_UseFlashlightShadows);
+		}
+	}
+#endif
 	if (GR_FlashlightShadowActive())
 	{
 		const unsigned casterHash = ShadowCasterHash();

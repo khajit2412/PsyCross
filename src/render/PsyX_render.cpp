@@ -2365,6 +2365,10 @@ extern "C" {
 int   g_vitaShadowSoft = 1;
 float g_vitaShadowSoftK = 80.0f;
 float g_vitaShadowSoftBlur = 1.0f;
+/* GPU cost probe (Vita Preferences, Shadow_Test): 1 = soft-shadow lookup
+ * skipped (the map is still rendered), 2 = map no longer rendered (the
+ * lookup still runs on the last one). */
+int   g_vitaShadowTest = 0;
 }
 static int s_compileShadowEsm = 0;
 static unsigned s_uniGen = 1;	/* GR_VitaUniformsCurrent cache generation */
@@ -4488,6 +4492,7 @@ static int GR_VitaUniformsCurrent(ShaderID prog, TextureID texture, TexFormat te
 		g.bias = RS(g_PsyX_FlashlightShadowBias); g.nOff = RS(g_PsyX_FlashlightShadowNormalOffset);
 		g.strength = RS(g_PsyX_FlashlightShadowStrength); g.zn = RS(g_shadowZNear); g.zf = RS(g_shadowZFar);
 		g.fade = RS(g_PsyX_FlashlightShadowFadeDist); g.k = GR_VitaShadowSoftK();
+		if (g_vitaShadowTest == 1) g.zn = -1e30f;
 	}
 
 	const unsigned slot = (unsigned)prog & 63u;
@@ -4865,7 +4870,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 			{
 #if defined(PSYX_VITA)
 				if (GR_VitaShadowSoft())
-					glUniform2f(u_shadowClipLoc, RS(g_shadowZNear), 1.0f / (RS(g_shadowZFar) - RS(g_shadowZNear)));
+					glUniform2f(u_shadowClipLoc, g_vitaShadowTest == 1 ? -1e30f : RS(g_shadowZNear), 1.0f / (RS(g_shadowZFar) - RS(g_shadowZNear)));
 				else
 #endif
 				glUniform2f(u_shadowClipLoc, RS(g_shadowZNear), RS(g_shadowZFar));
@@ -7171,6 +7176,8 @@ int GR_ShadowMapDue(void)
 		if (rate < 1) rate = 1;
 		if (rate > 4) rate = 4;
 	}
+	if (g_vitaShadowTest == 2 && s_mapValid)
+		return 0;
 	return !s_mapValid || s_vitaSceneNo - s_mapScene >= (unsigned)rate;
 }
 
