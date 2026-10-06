@@ -4173,6 +4173,15 @@ void DrawAllSplits()
 				if (x0 < -1 || x1 > dw + 1)
 				{
 					const GrVertex& g = g_vertexBuffer[sp.startVertex];
+					static unsigned s_barSeen[32];
+					const unsigned sig = ((unsigned)(x0 & 0x7FF) << 21) ^ ((unsigned)(x1 & 0x7FF) << 10) ^
+					                     ((unsigned)(unsigned short)g.page << 4) ^ (unsigned)(unsigned short)g.clut ^
+					                     ((unsigned)sp.textureId << 16) ^ (unsigned)(y0 & 0x3FF);
+					int k;
+					for (k = 0; k < s_barLogs && s_barSeen[k] != sig; k++) {}
+					if (k < s_barLogs)
+						continue;
+					s_barSeen[s_barLogs] = sig;
 					s_barLogs++;
 					eprintf("[BARDRAW] split %d: x %d..%d y %d..%d (disp %dx%d) verts=%u tex=%u fmt=%d blend=%d page=0x%x clut=0x%x uv=%d,%d dfe=%d clip=%d,%d %dx%d ofs=%d,%d\n",
 					        i, x0, x1, y0, y1, dw, dh, sp.numVerts, (unsigned)sp.textureId, (int)sp.texFormat,
