@@ -2195,23 +2195,19 @@ void GR_BeginScene()
 #if defined(PSYX_VITA) && USE_OPENGL
 	/* vitaGL rotates three display buffers and a 2D screen does not clear every
 	 * frame, so the pillarbox bars kept whatever an earlier frame drew there
-	 * (the Konami logo beside the title). Only the bars: the 4:3 image is the
-	 * game's to keep. */
+	 * (the Konami logo beside the title). The whole screen, not scissored bars:
+	 * vitaGL scissors through the GXM region clip, which works in tiles, and
+	 * the 58-pixel left bar at 480x272 was never cleared. PsyX_BeginScene
+	 * clears the 4:3 area every frame anyway. */
 	if (((g_PcHorPlusEnabled && g_PcWidescreenMode == 0) || (!g_PcHorPlusEnabled && g_PcMenuPillarbox)) &&
 	    g_windowHeight > 0 && g_windowWidth * 3 > g_windowHeight * 4)
 	{
-		const int vpW = (int)(g_windowHeight * 4.0f / 3.0f + 0.5f);
-		const int vpX = (g_windowWidth - vpW) / 2;
-		GLfloat   cc[4];
+		GLfloat cc[4];
 
 		glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
 		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-		glEnable(GL_SCISSOR_TEST);
-		glScissor(0, 0, vpX, g_windowHeight);
-		glClear(GL_COLOR_BUFFER_BIT);
-		glScissor(vpX + vpW, 0, g_windowWidth - vpX - vpW, g_windowHeight);
-		glClear(GL_COLOR_BUFFER_BIT);
 		glDisable(GL_SCISSOR_TEST);
+		glClear(GL_COLOR_BUFFER_BIT);
 		glClearColor(cc[0], cc[1], cc[2], cc[3]);
 		g_PreviousScissorState = -999;
 	}
