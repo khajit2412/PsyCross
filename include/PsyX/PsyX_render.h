@@ -458,6 +458,8 @@ extern void			GR_SetTexture(TextureID texture, TexFormat texFormat);
 extern void			GR_SetOverrideTextureSize(int width, int height, int offsetX, int offsetY, int hiresW, int hiresH);
 #if defined(PSYX_VITA)
 extern TextureID	GR_VitaPaletteTexture(int key, int* opaque);
+extern TextureID	GR_VitaPaletteTextureFind(int key, int* opaque);
+extern void		GR_VitaPaletteTextureBuild(const int* keys, int n);
 extern void		GR_VitaSetPaletteTexture(TextureID tex, int noDiscard);
 extern int			g_vitaForceLean;
 extern float		g_vitaLeanDim;

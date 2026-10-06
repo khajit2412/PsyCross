@@ -22,6 +22,27 @@
 
 int g_dbg_emulatorPaused = 0;
 
+/* The environments as the game last set them. With the parse worker on, the
+ * active ones belong to the parse (ParseRun applies these at the next OT). */
+DRAWENV g_psxGameDrawEnv;
+DISPENV g_psxGameDispEnv;
+int     g_psxGameDrawEnvDirty = 0, g_psxGameDispEnvDirty = 0;
+#if defined(__vita__)
+extern int  PsyX_ParseAsync(void);
+extern void PsyX_ParseEnqueue(u_long* ot, int clear);
+extern void PsyX_ParseNoteSync(void);
+/* DrawPrim prims parsed on the game thread and not yet drawn. */
+static int s_drawPrimPending = 0;
+
+/* Before a parse on the game thread (worker idle): the environments the game
+ * set since the last OT become the active ones. */
+static void PsyX_ApplyGameEnvs(void)
+{
+	if (g_psxGameDrawEnvDirty) { activeDrawEnv = g_psxGameDrawEnv; g_psxGameDrawEnvDirty = 0; }
+	if (g_psxGameDispEnvDirty) { activeDispEnv = g_psxGameDispEnv; g_psxGameDispEnvDirty = 0; }
+}
+#endif
+
 void(*drawsync_callback)(void) = NULL;
 
 int ClearImage(RECT16* rect, u_char r, u_char g, u_char b)
@@ -58,6 +79,21 @@ int DrawSync(int mode)
 	GR_UpdateVRAM();
 	GR_ReadFramebufferDataToVRAM();
 
+#if defined(__vita__)
+	/* With the parse worker the split list is its own; only prims DrawPrim
+	 * parsed here need drawing, after the worker has finished. */
+	if (PsyX_ParseWorkerOwnsEnv())
+	{
+		if (s_drawPrimPending)
+		{
+			PsyX_ParseFenceAt("DrawSync");
+			s_drawPrimPending = 0;
+			if (g_splitIndex > 0)
+				DrawAllSplits();
+		}
+	}
+	else
+#endif
 	if (g_splitIndex > 0)// && g_GPUDisabledState == 0) // don't do flips if nothing to draw.
 	{
 		DrawAllSplits();
@@ -151,6 +187,9 @@ int ResetGraph(int mode)
 	{
 		// reset GPU state
 		g_GPUDisabledState = 0;
+#if defined(__vita__)
+		PsyX_ParseFenceAt("ResetGraph");
+#endif
 		ClearImage(&activeDrawEnv.clip, 0, 0, 0);
 
 		ClearSplits();
@@ -271,6 +310,13 @@ int GetODE(void)
 
 DISPENV* GetDispEnv(DISPENV* env)//(F)
 {
+#if defined(__vita__)
+	if (PsyX_ParseWorkerOwnsEnv())
+	{
+		*env = g_psxGameDispEnv;
+		return env;
+	}
+#endif
 	*env = activeDispEnv;
 	return env;
 }
@@ -281,13 +327,18 @@ DISPENV* PutDispEnv(DISPENV* env)//To Finish
 		env->disp.y == currentDispEnv.disp.y)
 	{
 		// hacky and wacky but it avoids hacks in game code
-		activeDispEnv = currentDispEnv = *env;
+		g_psxGameDispEnv = currentDispEnv = *env;
 	}
 	else
 	{
-		activeDispEnv = currentDispEnv;
+		g_psxGameDispEnv = currentDispEnv;
 		currentDispEnv = *env;
 	}
+	g_psxGameDispEnvDirty = 1;
+#if defined(__vita__)
+	if (!PsyX_ParseWorkerOwnsEnv())
+#endif
+		activeDispEnv = g_psxGameDispEnv;
 
 	return 0;
 }
@@ -321,7 +372,12 @@ DRAWENV* GetDrawEnv(DRAWENV* env)
 
 DRAWENV* PutDrawEnv(DRAWENV* env)//Guessed
 {
-	memcpy((char*)&activeDrawEnv, env, sizeof(DRAWENV));
+	memcpy((char*)&g_psxGameDrawEnv, env, sizeof(DRAWENV));
+	g_psxGameDrawEnvDirty = 1;
+#if defined(__vita__)
+	if (!PsyX_ParseWorkerOwnsEnv())
+#endif
+		memcpy((char*)&activeDrawEnv, env, sizeof(DRAWENV));
 	return 0;
 }
 
@@ -468,10 +524,26 @@ void DrawOTag(u_long* p)
 	{
 		if (g_GPUDisabledState)
 		{
+#if defined(__vita__)
+			PsyX_ParseFenceAt("GPU disabled");
+#endif
 			ClearSplits();
 			return;
 		}
 
+#if defined(__vita__)
+		if (PsyX_ParseAsync())
+		{
+			PsyX_ParseEnqueue(p, PsyX_BeginScene());
+			return;
+		}
+		/* The synchronous path parses here: the worker must be done, and the
+		 * environments the game set since its last OT become the active ones. */
+		PsyX_ParseFenceAt("sync OT");
+		PsyX_ParseNoteSync();
+		if (PsyX_ParseWorkerOwnsEnv())
+			PsyX_ApplyGameEnvs();
+#endif
 		if (PsyX_BeginScene())
 		{
 			ClearSplits();
@@ -510,6 +582,14 @@ void DrawOTag(u_long* p)
  
 void DrawPrim(void* p)
 {
+#if defined(__vita__)
+	PsyX_ParseFenceAt("DrawPrim");
+	if (PsyX_ParseWorkerOwnsEnv())
+	{
+		PsyX_ApplyGameEnvs();
+		s_drawPrimPending = 1;
+	}
+#endif
 	if (g_GPUDisabledState)
 	{
 		ClearSplits();

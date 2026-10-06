@@ -797,17 +797,32 @@ struct GR_RSnap
 	decltype(::g_windowWidth) g_windowWidth;
 	decltype(::g_windowHeight) g_windowHeight;
 	decltype(::g_vitaBeamCull) g_vitaBeamCull;
+	decltype(::g_PsyX_FlashlightShadowPos) g_PsyX_FlashlightShadowPos;
+	decltype(::g_PsyX_FlashlightShadowFpsDrop) g_PsyX_FlashlightShadowFpsDrop;
 	float szMax;
 };
 static GR_RSnap     s_rs;
 static volatile int s_rsJob = 0;
+/* The parse worker's copy: the frame it parses was captured at its DrawOTag,
+ * while the game thread already rewrites the live globals for the next one. */
+static GR_RSnap     s_rsW;
+static int          s_rsWOn = 0;
+extern "C" int PsyX_OnParseWorker(void);
 
+static inline GR_RSnap* GR_RsCur(void)
+{
+	if (s_rsJob && VGLR_OnRenderThread())
+		return &s_rs;
+	if (s_rsWOn && PsyX_OnParseWorker())
+		return &s_rsW;
+	return nullptr;
+}
 static inline int GR_InJob(void)
 {
 	return s_rsJob && VGLR_OnRenderThread();
 }
-#define RS(x) (GR_InJob() ? s_rs.x : (x))
-#define RS_SZMAX() (GR_InJob() ? s_rs.szMax : PGXP_GetSzMax())
+#define RS(x) (GR_RsCur() ? GR_RsCur()->x : (x))
+#define RS_SZMAX() (GR_RsCur() ? GR_RsCur()->szMax : PGXP_GetSzMax())
 
 extern "C" int GR_RSnapSize(void)
 {
@@ -817,6 +832,11 @@ extern "C" int GR_RSnapSize(void)
 extern "C" void GR_RSnapCapture(void* dst)
 {
 	GR_RSnap* r = (GR_RSnap*)dst;
+	if (s_rsWOn && PsyX_OnParseWorker())
+	{
+		memcpy(r, &s_rsW, sizeof(*r));
+		return;
+	}
 	memcpy(&r->g_PsyX_UsePerPixelFlashlight, &g_PsyX_UsePerPixelFlashlight, sizeof(r->g_PsyX_UsePerPixelFlashlight));
 	memcpy(&r->g_PsyX_FlashlightActive, &g_PsyX_FlashlightActive, sizeof(r->g_PsyX_FlashlightActive));
 	memcpy(&r->g_PsyX_FlashlightStyle, &g_PsyX_FlashlightStyle, sizeof(r->g_PsyX_FlashlightStyle));
@@ -867,7 +887,25 @@ extern "C" void GR_RSnapCapture(void* dst)
 	memcpy(&r->g_windowWidth, &g_windowWidth, sizeof(r->g_windowWidth));
 	memcpy(&r->g_windowHeight, &g_windowHeight, sizeof(r->g_windowHeight));
 	memcpy(&r->g_vitaBeamCull, &g_vitaBeamCull, sizeof(r->g_vitaBeamCull));
+	memcpy(&r->g_PsyX_FlashlightShadowPos, &g_PsyX_FlashlightShadowPos, sizeof(r->g_PsyX_FlashlightShadowPos));
+	r->g_PsyX_FlashlightShadowFpsDrop = g_PsyX_FlashlightShadowFpsDrop;
 	r->szMax = PGXP_GetSzMax();
+}
+
+extern "C" void GR_RSnapInstallWorker(const void* src)
+{
+	if (src)
+	{
+		memcpy(&s_rsW, src, sizeof(s_rsW));
+		s_rsWOn = 1;
+	}
+	else
+		s_rsWOn = 0;
+}
+
+extern "C" void GR_RSnapWorkerSetDispEnv(const DISPENV* d)
+{
+	s_rsW.activeDispEnv = *d;
 }
 
 extern "C" void GR_RSnapInstall(const void* src)
@@ -5298,6 +5336,49 @@ TextureID GR_VitaPaletteTexture(int key, int* opaque)
 }
 
 
+/* The parse worker's lookup: a current cached texture or 0, never building
+ * one (that takes GL calls, which only the game thread may record). A miss
+ * draws through the VRAM sampler and is built later by
+ * GR_VitaPaletteTextureBuild on the game thread. */
+TextureID GR_VitaPaletteTextureFind(int key, int* opaque)
+{
+	const int tpage = (key >> 1) & 0x1F;
+	const int is8   = (key >> 6) & 1;
+	const int clut  = (key >> 7) & 0xFFFF;
+	const int px = (tpage & 15) * 64, py = ((tpage >> 4) & 1) * 256;
+	const int pw = is8 ? 128 : 64;
+	const int cx = (clut & 0x3F) * 16, cy = (clut >> 6) & 0x1FF;
+	const int cw = is8 ? 256 : 16;
+	int slot;
+
+	if (px + pw > VRAM_WIDTH || cx + cw > VRAM_WIDTH || cy >= VRAM_HEIGHT || !s_palcHashValid)
+		return 0;
+	const unsigned version = GR_PalcRectVersion(px, py, pw, 256) * 31u + GR_PalcRectVersion(cx, cy, cw, 1);
+	for (slot = GR_PalcHashSlot(key); s_palcHash[slot] >= 0; slot = (slot + 1) & (PALC_HASH - 1))
+	{
+		const int idx = s_palcHash[slot];
+		if (s_palc[idx].key == key)
+		{
+			if (s_palc[idx].version != version || !s_palc[idx].tex)
+				return 0;
+			s_palc[idx].lastFrame = s_palcFrame;
+			g_vitaPalCacheStats[0]++;
+			*opaque = s_palc[idx].opaque;
+			return s_palc[idx].tex;
+		}
+	}
+	return 0;
+}
+
+void GR_VitaPaletteTextureBuild(const int* keys, int n)
+{
+	int i, opaque;
+	for (i = 0; i < n; i++)
+		GR_VitaPaletteTexture(keys[i], &opaque);
+	if (!s_palcHashValid)
+		GR_PalcRebuildHash();
+}
+
 /* Binds a cached palette texture through the RGBA override path. */
 void GR_VitaSetPaletteTexture(TextureID tex, int noDiscard)
 {
@@ -5315,6 +5396,9 @@ void GR_VitaSetPaletteTexture(TextureID tex, int noDiscard)
 
 void GR_ClearVRAM(int x, int y, int w, int h, unsigned char r, unsigned char g, unsigned char b)
 {
+#if defined(PSYX_VITA)
+	PsyX_ParseFenceAt("VRAM clear");
+#endif
 	vram_need_update = 1;
 #if defined(PSYX_VITA)
 	GR_VitaPalCacheNoteWrite(x, y, w, h);
@@ -7052,9 +7136,9 @@ static void GR_VitaSteadyShadowLight(float eye[3], float dir[3])
 
 static void GR_BuildShadowMatrix(void)
 {
-	float sizeActive = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightSizeFps : g_PsyX_FlashlightSize;
+	float sizeActive = RS(g_PsyX_FlashlightFpsMode) ? RS(g_PsyX_FlashlightSizeFps) : RS(g_PsyX_FlashlightSize);
 
-	float flOuter = 1.0f - sizeActive * (1.0f - g_PsyX_FlashlightOuterCos);
+	float flOuter = 1.0f - sizeActive * (1.0f - RS(g_PsyX_FlashlightOuterCos));
 	if (flOuter < 0.05f)  flOuter = 0.05f;
 	if (flOuter > 0.999f) flOuter = 0.999f;
 
@@ -7063,28 +7147,28 @@ static void GR_BuildShadowMatrix(void)
 	if (fov < 0.2f) fov = 0.2f;
 
 	float zn = 20.0f;
-	float zf = g_PsyX_FlashlightRange * 1.3f;
+	float zf = RS(g_PsyX_FlashlightRange) * 1.3f;
 	if (zf < zn + 1.0f) zf = zn + 1.0f;
-	g_shadowZNear = zn;
-	g_shadowZFar  = zf;
+	RS(g_shadowZNear) = zn;
+	RS(g_shadowZFar)  = zf;
 
 	/* FPS pins the CONE at the eye (so the beam follows the view), but the shadow
 	 * must originate at the REAL light (chest/hand) — else the depth map is the
 	 * camera's own view and the shadow either vanishes or floats beside the object.
-	 * g_PsyX_FlashlightShadowPos carries that true light position (== FlashlightPos
+	 * RS(g_PsyX_FlashlightShadowPos) carries that true light position (== FlashlightPos
 	 * in TPS). */
-	const float* srcPos = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightShadowPos : g_PsyX_FlashlightPos;
+	const float* srcPos = RS(g_PsyX_FlashlightFpsMode) ? RS(g_PsyX_FlashlightShadowPos) : RS(g_PsyX_FlashlightPos);
 	float eye[3] = { srcPos[0], srcPos[1], srcPos[2] };
-	float dir[3] = { g_PsyX_FlashlightDir[0], g_PsyX_FlashlightDir[1], g_PsyX_FlashlightDir[2] };
+	float dir[3] = { RS(g_PsyX_FlashlightDir)[0], RS(g_PsyX_FlashlightDir)[1], RS(g_PsyX_FlashlightDir)[2] };
 	sh_normalize3(dir);
 	/* Optional fine-tune: nudge the shadow light back along -viewDir. Default 0
 	 * (pure physical light position); `shadowfpsdrop` lets the user dial extra
 	 * parallax if a scene wants it. */
-	if (g_PsyX_FlashlightFpsMode && g_PsyX_FlashlightShadowFpsDrop != 0.0f)
+	if (g_PsyX_FlashlightFpsMode && RS(g_PsyX_FlashlightShadowFpsDrop) != 0.0f)
 	{
-		eye[0] -= dir[0] * g_PsyX_FlashlightShadowFpsDrop;
-		eye[1] -= dir[1] * g_PsyX_FlashlightShadowFpsDrop;
-		eye[2] -= dir[2] * g_PsyX_FlashlightShadowFpsDrop;
+		eye[0] -= dir[0] * RS(g_PsyX_FlashlightShadowFpsDrop);
+		eye[1] -= dir[1] * RS(g_PsyX_FlashlightShadowFpsDrop);
+		eye[2] -= dir[2] * RS(g_PsyX_FlashlightShadowFpsDrop);
 	}
 #if defined(PSYX_VITA)
 	GR_VitaSteadyShadowLight(eye, dir);
@@ -7097,7 +7181,7 @@ static void GR_BuildShadowMatrix(void)
 	float proj[16], view[16];
 	sh_perspective(fov, 1.0f, zn, zf, proj);
 	sh_lookat(eye, center, up, view);
-	sh_mul(proj, view, g_shadowLightMatrix);
+	sh_mul(proj, view, RS(g_shadowLightMatrix));
 }
 
 int GR_FlashlightShadowActive(void)
@@ -7108,9 +7192,9 @@ int GR_FlashlightShadowActive(void)
 	 * pre-pass corrupts unrelated rendering (white flash on room/inventory/map
 	 * transitions, Harry's face dropping out on the options screen). Shadows are a
 	 * live-gameplay-only effect. */
-	return (g_PsyX_UseFlashlightShadows && g_PsyX_UsePerPixelFlashlight &&
-	        g_PsyX_FlashlightActive && g_PsyX_ShadowsAllowed &&
-	        !g_PsxPresentLastFrame) ? 1 : 0;
+	return (RS(g_PsyX_UseFlashlightShadows) && RS(g_PsyX_UsePerPixelFlashlight) &&
+	        RS(g_PsyX_FlashlightActive) && RS(g_PsyX_ShadowsAllowed) &&
+	        !RS(g_PsxPresentLastFrame)) ? 1 : 0;
 }
 
 static GLint s_shadowPrevFBO = 0;
@@ -7147,7 +7231,7 @@ int GR_ShadowMapCurrent(unsigned casterHash)
 	GR_BuildShadowMatrix();
 	const int cur = s_mapValid && g_shadowFBO != 0 && casterHash == s_mapCasterHash &&
 	                s_shadowTexSoft == GR_VitaShadowSoft() && s_shadowTexSize == g_PsyX_ShadowMapSize &&
-	                memcmp(s_mapMatrix, g_shadowLightMatrix, sizeof(s_mapMatrix)) == 0;
+	                memcmp(s_mapMatrix, RS(g_shadowLightMatrix), sizeof(s_mapMatrix)) == 0;
 	g_vitaShadowStat[cur ? 1 : 0]++;
 	return cur;
 }
@@ -7158,7 +7242,7 @@ void GR_ShadowMapKeep(void)
 {
 	g_vitaShadowStat[2]++;
 	if (s_mapValid)
-		memcpy(g_shadowLightMatrix, s_mapMatrix, sizeof(s_mapMatrix));
+		memcpy(RS(g_shadowLightMatrix), s_mapMatrix, sizeof(s_mapMatrix));
 }
 
 /* Shadow map refresh rate while the casters or the light move (config
@@ -7189,7 +7273,7 @@ void GR_ShadowLightMatrix(float out[16])
 void GR_ShadowMapWritten(unsigned casterHash)
 {
 	s_mapScene = s_vitaSceneNo;
-	memcpy(s_mapMatrix, g_shadowLightMatrix, sizeof(s_mapMatrix));
+	memcpy(s_mapMatrix, RS(g_shadowLightMatrix), sizeof(s_mapMatrix));
 	s_mapCasterHash = casterHash;
 	s_mapValid = 1;
 }
@@ -8715,6 +8799,9 @@ static void GR_RestoreStoredFramebufferRegion(void)
 
 void GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int dst_y)
 {
+#if defined(PSYX_VITA)
+	PsyX_ParseFenceAt("VRAM write");
+#endif
 	vram_need_update = 1;
 
 	int stride = w;
@@ -8765,6 +8852,9 @@ void GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int
 
 void GR_ReadVRAM(unsigned short* dst, int x, int y, int dst_w, int dst_h)
 {
+#if defined(PSYX_VITA)
+	PsyX_ParseFenceAt("VRAM read");
+#endif
 	unsigned short* src = vram + x + VRAM_WIDTH * y;
 
 	for (int i = 0; i < dst_h; i++) {
@@ -8785,6 +8875,7 @@ void GR_UpdateVRAM()
 	if (!vram_need_update)
 		return;
 #if defined(PSYX_VITA)
+	PsyX_ParseFenceAt("VRAM upload");
 	VGLR_JobFence();
 #endif
 

@@ -19,6 +19,14 @@ extern DISPENV currentDispEnv;
 extern DISPENV activeDispEnv;
 extern DRAWENV activeDrawEnv;
 extern int g_GPUDisabledState;
+extern DRAWENV g_psxGameDrawEnv;
+extern DISPENV g_psxGameDispEnv;
+extern int g_psxGameDrawEnvDirty, g_psxGameDispEnvDirty;
+int  PsyX_ParseWorkerOwnsEnv(void);
+void PsyX_ParseFenceAt(const char* who);
+void PsyX_ParseFrameEnd(void);
+void PsyX_ParseFenceBuffer(int buf);
+void PsyX_ParseQueueReport(double frames);
 
 void ClearSplits();
 void DrawAllSplits();
