@@ -6054,18 +6054,30 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 					((unsigned)(RS(activeDispEnv).disp.h & 0x3FF) << 12) ^
 					((unsigned)(RS(g_windowWidth) & 0xFFF)) ^
 					((unsigned)(RS(g_PcHorPlusEnabled) ? 1u : 0u) << 31) ^
-					((unsigned)(RS(g_PcWidescreenMode) & 3) << 29);
-				int seen = 0;
-				for (int i = 0; i < s_aspSeenN; i++) if (s_aspSeen[i] == key) { seen = 1; break; }
-				if (!seen && s_aspSeenN < 8) {
-					s_aspSeen[s_aspSeenN++] = key;
-					fprintf(aspOut, "[ASPECT] disp=%dx%d win=%dx%d psxAspect=%.4f winAspect=%.4f horScale=%.4f HorPlus=%d WS=%d PAR=%.4f margin=%.1f vp=%d+%dx%d C2_H=%d OFX=%d OFY=%d\n",
-						(int)RS(activeDispEnv).disp.w, (int)RS(activeDispEnv).disp.h,
+					((unsigned)(RS(g_PcWidescreenMode) & 3) << 29) ^
+					((unsigned)(RS(g_PsxWorldHScale) * 4096.0f) * 40503u);
+				/* Every change, not each layout once: a single frame drawn with
+				 * another layout (seen in play as the picture "resizing" for an
+				 * instant) only shows up this way. */
+				static unsigned s_aspLast = 0xFFFFFFFFu;
+				static int s_aspLogs = 0;
+				(void)s_aspSeen; (void)s_aspSeenN;
+				if (key != s_aspLast && s_aspLogs < 300) {
+					unsigned aspScene = 0;
+#if defined(PSYX_VITA)
+					aspScene = s_vitaSceneNo;
+#endif
+					s_aspLast = key;
+					s_aspLogs++;
+					fprintf(aspOut, "[ASPECT] scene %u: disp=%dx%d win=%dx%d psxAspect=%.4f winAspect=%.4f horScale=%.4f HorPlus=%d WS=%d PAR=%.4f margin=%.1f vp=%d+%dx%d C2_H=%d OFX=%d OFY=%d hscale=%.4f\n",
+						aspScene, (int)RS(activeDispEnv).disp.w, (int)RS(activeDispEnv).disp.h,
 						RS(g_windowWidth), RS(g_windowHeight), psxAspect, winAspect, horScale,
 						RS(g_PcHorPlusEnabled), RS(g_PcWidescreenMode), (float)PSX_NTSC_PIXEL_ASPECT,
 						dbgMargin, dbgVpX, dbgVpW, RS(g_windowHeight),
-						(int)C2_H, (int)(C2_OFX >> 16), (int)(C2_OFY >> 16));
+						(int)C2_H, (int)(C2_OFX >> 16), (int)(C2_OFY >> 16), RS(g_PsxWorldHScale));
+#if !defined(PSYX_VITA)
 					fflush(aspOut);
+#endif
 				}
 			}
 		}
