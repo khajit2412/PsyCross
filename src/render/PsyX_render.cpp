@@ -2164,6 +2164,26 @@ void GR_UpdateSwapIntervalState(int swapInterval)
 #endif
 }
 
+#if defined(PSYX_VITA) && USE_OPENGL
+extern "C" void* VGLR_JobBegin(void (*fn)(void*), size_t bytes);
+extern "C" void  VGLR_JobEnd(void);
+
+/* Runs on the render thread: the game thread's recorder filters GL calls
+ * against its own copy of the state, and the draw jobs set the scissor
+ * directly, so a glDisable(GL_SCISSOR_TEST) recorded here was dropped as
+ * redundant while the job's 4:3 scissor was still on. */
+static void GR_VitaClearScreenJob(void*)
+{
+	GLfloat cc[4];
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glDisable(GL_SCISSOR_TEST);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glClearColor(cc[0], cc[1], cc[2], cc[3]);
+	g_PreviousScissorState = -999;
+}
+#endif
+
 void GR_BeginScene()
 {
 #if defined(PSYX_VITA)
@@ -2202,14 +2222,10 @@ void GR_BeginScene()
 	if (((g_PcHorPlusEnabled && g_PcWidescreenMode == 0) || (!g_PcHorPlusEnabled && g_PcMenuPillarbox)) &&
 	    g_windowHeight > 0 && g_windowWidth * 3 > g_windowHeight * 4)
 	{
-		GLfloat cc[4];
-
-		glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
-		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-		glDisable(GL_SCISSOR_TEST);
-		glClear(GL_COLOR_BUFFER_BIT);
-		glClearColor(cc[0], cc[1], cc[2], cc[3]);
-		g_PreviousScissorState = -999;
+		if (VGLR_JobBegin(GR_VitaClearScreenJob, 8))
+			VGLR_JobEnd();
+		else
+			GR_VitaClearScreenJob(nullptr);
 	}
 #endif
 
