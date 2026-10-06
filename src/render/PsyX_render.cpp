@@ -2214,13 +2214,11 @@ void GR_BeginScene()
 
 #if defined(PSYX_VITA) && USE_OPENGL
 	/* vitaGL rotates three display buffers and a 2D screen does not clear every
-	 * frame, so the pillarbox bars kept whatever an earlier frame drew there
-	 * (the Konami logo beside the title). The whole screen, not scissored bars:
-	 * vitaGL scissors through the GXM region clip, which works in tiles, and
-	 * the 58-pixel left bar at 480x272 was never cleared. PsyX_BeginScene
-	 * clears the 4:3 area every frame anyway. */
-	if (((g_PcHorPlusEnabled && g_PcWidescreenMode == 0) || (!g_PcHorPlusEnabled && g_PcMenuPillarbox)) &&
-	    g_windowHeight > 0 && g_windowWidth * 3 > g_windowHeight * 4)
+	 * frame, so the pillarbox bars kept whatever an earlier frame drew there.
+	 * PsyX_BeginScene clears the game's area every frame anyway. */
+	/* Every frame, not only when the pillarbox flags say so: the title runs
+	 * pillarboxed with Hor+ off and the menu flag unset, and the bars kept
+	 * the Konami logo. A full clear costs nothing on the tiler. */
 	{
 		if (VGLR_JobBegin(GR_VitaClearScreenJob, 8))
 			VGLR_JobEnd();
