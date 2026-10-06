@@ -2880,7 +2880,14 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 	/* Light clip position is linear in v_shadowViewPos, so it interpolates
 	 * exactly and the per-pixel mat4 goes away (Vita shadow variants). */\
 	"#ifdef PSYX_SHADOW_VS\n"\
+	"#ifdef PSYX_SHADOW_ESM\n"\
+	/* xy/w is invariant to the 1/z-space scale; z carries that scale so the
+	 * fragment can recover the true light-space w for the depth test. */\
+	"		vec4 lc = u_shadowMatrix * v_shadowViewPos;\n"\
+	"		v_lightClip = vec4(lc.xy, v_shadowViewPos.w, lc.w);\n"\
+	"#else\n"\
 	"		v_lightClip = u_shadowMatrix * v_shadowViewPos;\n"\
+	"#endif\n"\
 	"#endif\n"\
 	"	}\n"
 
@@ -3117,7 +3124,11 @@ static float g_PsxBlendSrc[2] = { 1.0f, 0.0f };
 #	define GPU_SHADOW_ESM_LOOKUP\
 	"#ifdef PSYX_SHADOW_ESM\n"\
 	"						vec2 luv = lp.xy / lp.w * 0.5 + 0.5;\n"\
+	"#ifdef PSYX_SHADOW_VS\n"\
+	"						float zr = (lp.w / lp.z - u_shadowClip.x) * u_shadowClip.y;\n"\
+	"#else\n"\
 	"						float zr = (lp.w - u_shadowClip.x) * u_shadowClip.y;\n"\
+	"#endif\n"\
 	"						if (luv.x > 0.0 && luv.x < 1.0 && luv.y > 0.0 && luv.y < 1.0 && zr < 1.0) {\n"\
 	"							float vis = exp(min(0.0, u_shadowTexel.x * (texture2D(u_shadowTex, luv).r - zr + u_shadowBias)));\n"\
 	"							shadow = 1.0 - u_shadowStrength * (1.0 - vis);\n"\
@@ -3749,7 +3760,12 @@ ShaderID GR_Shader_Compile(const char* source)
 		if (!(s_compileLitVariant & 1))
 			strcat(extra_fs_defines, "#define PSYX_NO_SHADOW\n");
 		else if (s_compileLitVariant & 4)
-			strcat(extra_fs_defines, "#define PSYX_SHADOW_ESM\n");
+		{
+			/* The light transform per vertex instead of per pixel: the GPU
+			 * sized every lit pixel's registers for the per-pixel matrix. */
+			strcat(extra_fs_defines, "#define PSYX_SHADOW_ESM\n#define PSYX_SHADOW_VS\n");
+			strcat(extra_vs_defines, "#define PSYX_SHADOW_ESM\n#define PSYX_SHADOW_VS\n");
+		}
 		else
 		{
 			/* PSYX_SHADOW_VS (light clip position from the vertex shader) is left
