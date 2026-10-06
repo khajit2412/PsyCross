@@ -4770,9 +4770,44 @@ static unsigned s_ppTick;
 #define PP_DONE() ((void)0)
 #endif
 
+#if defined(__vita__)
+/* The parse reads each prim's shadow entries, depth slot and affine slot from
+ * tables written much earlier in the frame, so every first touch misses to
+ * DRAM. Requested up front, the misses overlap the clut, hires and split work
+ * that runs before the vertices are built. */
+static inline void ParsePrefetch(const P_TAG* tag, const short* const* xy, int n)
+{
+	const uintptr_t key = (uintptr_t)tag;
+	__builtin_prefetch(&g_szTable[(key >> 2) & SZ_TABLE_MASK]);
+	__builtin_prefetch(&s_affine[((key >> 2) * 2654435761u) & AFFINE_MASK]);
+	if (s_shadow == nullptr)
+		return;
+	for (int i = 0; i < n; i++)
+	{
+		const uintptr_t k = (uintptr_t)xy[i];
+		if (k - (uintptr_t)g_PsxScratchpad >= sizeof(g_PsxScratchpad))
+			__builtin_prefetch(&s_shadow[ShadowHash(k)]);
+	}
+}
+#endif
+
 static int ProcessGouraudPoly(P_TAG* polyTag)
 {
 	PP_BEGIN();
+#if defined(__vita__)
+	if ((polyTag->code & 0x0C) == 0x0C)
+	{
+		const POLY_GT4* q = (const POLY_GT4*)polyTag;
+		const short* xy[4] = { &q->x0, &q->x1, &q->x2, &q->x3 };
+		ParsePrefetch(polyTag, xy, 4);
+	}
+	else if ((polyTag->code & 0x0C) == 0x04)
+	{
+		const POLY_GT3* t = (const POLY_GT3*)polyTag;
+		const short* xy[3] = { &t->x0, &t->x1, &t->x2 };
+		ParsePrefetch(polyTag, xy, 3);
+	}
+#endif
 	/* PGXP hint (3D polygons only). 0xFFFF / ignored when PGXP off. */
 	const u_short gteIndex = g_PsxUsePgxp ? polyTag->pgxp_index : (u_short)0xFFFF;
 	if (g_PsxUsePgxp) PGXP_BeginPrim(polyTag);
