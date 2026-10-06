@@ -126,7 +126,68 @@ static inline ShadowEntry* Sh_Scratch(uintptr_t k) {
 	return (off < sizeof(g_PsxScratchpad)) ? &s_scratchShadow[off >> 2] : nullptr;
 }
 
+/* Prim fields live in the game's two packet buffers, written front to back
+ * every frame. Their words index a per-buffer map into a frame-local entry
+ * pool allocated in write order, so the copy at build time and the lookups
+ * at parse both walk memory sequentially instead of missing the 32 MB hash
+ * table at random. Addresses past the mapped front fall back to the hash. */
+#define PKT_MAP_BYTES (1u << 20)
+#define PKT_POOL_SIZE 65536u
+static uintptr_t s_pktBase[2];
+static uint32_t* s_pktMap[2];
+static ShadowEntry* s_pktPool;
+static unsigned s_pktPoolN, s_pktPoolGen;
+
+extern "C" void PsyX_SetPacketBuffers(void* buf0, void* buf1)
+{
+	s_pktMap[0] = (uint32_t*)calloc(PKT_MAP_BYTES / 4, sizeof(uint32_t));
+	s_pktMap[1] = (uint32_t*)calloc(PKT_MAP_BYTES / 4, sizeof(uint32_t));
+	s_pktPool = (ShadowEntry*)memalign(64, PKT_POOL_SIZE * sizeof(ShadowEntry));
+	if (!s_pktMap[0] || !s_pktMap[1] || !s_pktPool)
+		return;
+	memset(s_pktPool, 0, PKT_POOL_SIZE * sizeof(ShadowEntry));
+	s_pktBase[0] = (uintptr_t)buf0;
+	s_pktBase[1] = (uintptr_t)buf1;
+}
+
+static inline uint32_t* Sh_PktMapSlot(uintptr_t k) {
+	uintptr_t off = k - s_pktBase[0];
+	if (off < PKT_MAP_BYTES && s_pktBase[0]) return &s_pktMap[0][off >> 2];
+	off = k - s_pktBase[1];
+	if (off < PKT_MAP_BYTES && s_pktBase[1]) return &s_pktMap[1][off >> 2];
+	return nullptr;
+}
+
+static inline const ShadowEntry* Sh_PktFind(const uint32_t* m, uintptr_t k) {
+	const uint32_t v = *m;
+	if (v == 0 || s_pktPoolGen != s_pgxpGen) return nullptr;
+	const ShadowEntry* e = &s_pktPool[v - 1];
+	return (e->key == k && e->gen == s_pgxpGen) ? e : nullptr;
+}
+
+static inline ShadowEntry* Sh_PktSlot(uint32_t* m, uintptr_t k) {
+	if (s_pktPoolGen != s_pgxpGen) { s_pktPoolGen = s_pgxpGen; s_pktPoolN = 0; }
+	const uint32_t v = *m;
+	if (v != 0 && v <= s_pktPoolN) {
+		ShadowEntry* e = &s_pktPool[v - 1];
+		if (e->key == k && e->gen == s_pgxpGen) return e;
+	}
+	if (s_pktPoolN >= PKT_POOL_SIZE) return nullptr;
+	ShadowEntry* e = &s_pktPool[s_pktPoolN++];
+	*m = s_pktPoolN;
+	e->key = k; e->gen = s_pgxpGen; e->hasP = 0; e->hasV = 0;
+	return e;
+}
+
+static ShadowEntry* Sh_SlotHash(uintptr_t k);
 static ShadowEntry* Sh_Slot(uintptr_t k) {
+	if (uint32_t* m = Sh_PktMapSlot(k)) {
+		if (ShadowEntry* e = Sh_PktSlot(m, k)) return e;
+	}
+	return Sh_SlotHash(k);
+}
+
+static ShadowEntry* Sh_SlotHash(uintptr_t k) {
 	if (ShadowEntry* d = Sh_Scratch(k)) {
 		if (d->key != k || d->gen != s_pgxpGen) {
 			d->key = k; d->gen = s_pgxpGen; d->hasP = 0; d->hasV = 0;
@@ -155,6 +216,10 @@ static ShadowEntry* Sh_Slot(uintptr_t k) {
 }
 
 static const ShadowEntry* Sh_Find(uintptr_t k) {
+	if (const uint32_t* m = Sh_PktMapSlot(k)) {
+		if (const ShadowEntry* e = Sh_PktFind(m, k)) return e;
+		if (s_pktPoolN < PKT_POOL_SIZE || s_pktPoolGen != s_pgxpGen) return nullptr;
+	}
 	if (const ShadowEntry* d = Sh_Scratch(k))
 		return (d->key == k && d->gen == s_pgxpGen) ? d : nullptr;
 	if (s_shadow == nullptr)
@@ -3981,10 +4046,11 @@ static void FillFaceNormals(GrVertex* v, int nVerts)
 		char cx = 0, cy = 0, cz = -127;
 		if (l2 > 1e-12f && l2 < 1e30f)
 		{
-			const float k = 127.0f / sqrtf(l2);
-			cx = (char)lrintf(nx * k);
-			cy = (char)lrintf(ny * k);
-			cz = (char)lrintf(nz * k);
+			const float k = 127.0f / __builtin_sqrtf(l2);
+			nx *= k; ny *= k; nz *= k;
+			cx = (char)(int)(nx + (nx < 0.0f ? -0.5f : 0.5f));
+			cy = (char)(int)(ny + (ny < 0.0f ? -0.5f : 0.5f));
+			cz = (char)(int)(nz + (nz < 0.0f ? -0.5f : 0.5f));
 		}
 		t[0].fnx = t[1].fnx = t[2].fnx = cx;
 		t[0].fny = t[1].fny = t[2].fny = cy;
@@ -4803,7 +4869,9 @@ static inline void ParsePrefetch(const P_TAG* tag, const short* const* xy, int n
 	for (int i = 0; i < n; i++)
 	{
 		const uintptr_t k = (uintptr_t)xy[i];
-		if (k - (uintptr_t)g_PsxScratchpad >= sizeof(g_PsxScratchpad))
+		if (const uint32_t* m = Sh_PktMapSlot(k)) {
+			if (*m) __builtin_prefetch(&s_pktPool[*m - 1]);
+		} else if (k - (uintptr_t)g_PsxScratchpad >= sizeof(g_PsxScratchpad))
 			__builtin_prefetch(&s_shadow[ShadowHash(k)]);
 	}
 }
