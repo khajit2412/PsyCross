@@ -728,6 +728,11 @@ void PrintMessageToOutput(SpewType_t spewtype, char const* pMsgFormat, va_list a
 {
 	static char pTempBuffer[4096];
 	int len = 0;
+#if defined(__vita__)
+	/* stdout goes nowhere there: with the log off, skip the formatting too. */
+	if (!g_logStream)
+		return;
+#endif
 	vsprintf(&pTempBuffer[len], pMsgFormat, args);
 
 #ifdef WIN32
@@ -774,7 +779,7 @@ void PrintMessageToOutput(SpewType_t spewtype, char const* pMsgFormat, va_list a
 		}
 		__android_log_write(prio, "PsyX", pTempBuffer);
 	}
-#else
+#elif !defined(__vita__)
 	printf(pTempBuffer);
 #endif
 

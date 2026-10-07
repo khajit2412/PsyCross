@@ -4879,7 +4879,8 @@ static int ProcessFlatPoly(P_TAG* polyTag)
  * prim in eight (the clock read is a syscall). */
 extern "C" { unsigned long long g_vitaParseProf[8]; unsigned g_vitaParseProfN; }
 static unsigned s_ppTick;
-#define PP_BEGIN() const int _pp = ((++s_ppTick & 7) == 0); unsigned long long _pt = _pp ? SPLIT_T() : 0ULL
+extern FILE* g_logStream;
+#define PP_BEGIN() const int _pp = g_logStream && ((++s_ppTick & 7) == 0); unsigned long long _pt = _pp ? SPLIT_T() : 0ULL
 #define PP_MARK(i) do { if (_pp) { const unsigned long long _n = SPLIT_T(); g_vitaParseProf[i] += _n - _pt; _pt = _n; } } while (0)
 #define PP_DONE() do { PP_MARK(6); if (_pp) g_vitaParseProfN++; } while (0)
 #else
