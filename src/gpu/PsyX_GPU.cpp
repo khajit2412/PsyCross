@@ -2056,6 +2056,40 @@ extern "C" void PsyX_GetDrawEnvOffset(float* x, float* y)
 		DrawEnvOffset(*x, *y);
 }
 
+#if defined(__vita__)
+/* Covers the pillarbox bars with black after a 2D frame's own prims. The GXM
+ * viewport positions geometry without clipping it, and the scissor cannot
+ * crop it either (vitaGL builds scissor from the stencil buffer, which the
+ * mask-bit emulation owns), so a prim past the display edge -- the title
+ * background is 416 wide on a 320 screen -- drew into the bars with whatever
+ * VRAM held there: the Konami logo. These two fills extend past the display
+ * the same way and land on top of it. */
+extern "C" void PsyX_VitaCoverPillarbox(void)
+{
+	extern int g_PcHorPlusEnabled, g_PcWidescreenMode, g_PcMenuPillarbox, g_windowHeight;
+	const int pillar = (g_PcHorPlusEnabled && g_PcWidescreenMode == 0) || (!g_PcHorPlusEnabled && g_PcMenuPillarbox);
+	if (!pillar || g_windowHeight <= 0 || g_windowWidth * 3 <= g_windowHeight * 4 || g_GPUDisabledState)
+		return;
+
+	float ox, oy;
+	DrawEnvOffset(ox, oy);
+	TILE t[2];
+	for (int i = 0; i < 2; i++)
+	{
+		setTile(&t[i]);
+		setRGB0(&t[i], 0, 0, 0);
+		t[i].y0 = (short)(-1024 - (int)oy);
+		t[i].w  = 2048;
+		t[i].h  = 4096;
+	}
+	t[0].x0 = (short)(-2048 - (int)ox);
+	t[1].x0 = (short)(activeDispEnv.disp.w - (int)ox);
+	ParsePrimitivesLinkedList((u_long*)&t[0], 1);
+	ParsePrimitivesLinkedList((u_long*)&t[1], 1);
+	DrawAllSplits();
+}
+#endif
+
 inline void ScreenCoordsToEmulator(GrVertex* vertex, int count)
 {
 }

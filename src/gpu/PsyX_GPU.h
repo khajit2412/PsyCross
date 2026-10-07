@@ -24,6 +24,9 @@ void ClearSplits();
 void DrawAllSplits();
 
 extern void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive);
+#if defined(__vita__)
+void PsyX_VitaCoverPillarbox(void);
+#endif
 
 #if defined(_LANGUAGE_C_PLUS_PLUS)||defined(__cplusplus)||defined(c_plusplus)
 }

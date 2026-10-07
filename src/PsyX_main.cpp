@@ -1240,6 +1240,9 @@ void PsyX_EndScene()
 	if (g_PsyX_WheelUpFrames   > 0) g_PsyX_WheelUpFrames--;
 	if (g_PsyX_WheelDownFrames > 0) g_PsyX_WheelDownFrames--;
 
+#if defined(__vita__)
+	PsyX_VitaCoverPillarbox();
+#endif
 	PGXP_CoverageTick();
 
 	ES_MARK(-1);
