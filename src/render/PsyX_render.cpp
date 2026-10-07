@@ -4376,48 +4376,19 @@ void GR_Perspective3D(const float fov, const float width, const float height, co
 #endif
 }
 
-/* PC port: the window sub-rect the game is actually presented into (pillarbox
- * leaves black bars at the sides). The framebuffer-feedback capture must read
- * THIS, not the whole window: squashing the full window into the 320x224
- * feedback buffer shrinks the image horizontally by vpW/windowWidth, and because
- * the effect re-reads its own output every frame that scale compounds — the
- * picture collapses toward the centre and builds up a vertical line after a few
- * seconds. Recorded from the same block that calls GR_SetViewPort so the two can
- * never disagree. */
-static int g_presentVp[4] = { 0, 0, 0, 0 };
-
 void GR_SetupClipMode(const RECT16* rect, int enable)
 {
 	// [A] isinterlaced dirty hack for widescreen
-	const bool clipOn = enable && (RS(activeDispEnv).isinter ||
+	const bool scissorOn = enable && (RS(activeDispEnv).isinter ||
 		(	rect->x - RS(activeDispEnv).disp.x > 0 ||
 			rect->y - RS(activeDispEnv).disp.y > 0 ||
 			rect->w < RS(activeDispEnv).disp.w - 1 ||
 			rect->h < RS(activeDispEnv).disp.h - 1));
-#if defined(PSYX_VITA)
-	/* The GXM viewport positions geometry but does not clip it, so a prim past
-	 * the display edge -- the title background is 416 wide on a 320 screen --
-	 * drew into the pillarbox bars with whatever VRAM held there (the Konami
-	 * logo). The PS1 display window cropped it; the scissor does here. */
-	const int  vpX = g_presentVp[0], vpY = g_presentVp[1], vpW = g_presentVp[2], vpH = g_presentVp[3];
-	const bool pillar = enable && vpW > 0 && vpW < RS(g_windowWidth);
-#else
-	const int  vpX = 0, vpY = 0, vpW = RS(g_windowWidth), vpH = RS(g_windowHeight);
-	const bool pillar = false;
-#endif
-	const bool scissorOn = clipOn || pillar;
 
 	GR_SetScissorState(scissorOn);
 
 	if (!scissorOn)
 		return;
-#if USE_OPENGL
-	if (!clipOn)
-	{
-		glScissor(vpX, vpY, vpW, vpH);
-		return;
-	}
-#endif
 
 	// Runtime gate: same as the ortho selection — non-PGXP path uses
 	// emuScreenAspect=1 (no widescreen aspect remap) so the scissor
@@ -4448,14 +4419,11 @@ void GR_SetupClipMode(const RECT16* rect, int enable)
 
 #if USE_OPENGL
 	// adjust scissor rectangle by the backbuffer size (window dimensions)
-	/* Into the presented rect: the full window unless pillarboxed. */
-	const float winW = pillar ? (float)vpW : (float)RS(g_windowWidth);
 	const float flipOffset = RS(g_windowHeight) - clipRectH * (float)RS(g_windowHeight);
-	const float crx = (pillar ? (float)vpX : 0.0f) + clipRectX * winW;
+	const float crx = clipRectX * (float)RS(g_windowWidth);
 	const float cry = clipRectY * (float)RS(g_windowHeight);
-	const float crw = clipRectW * winW;
+	const float crw = clipRectW * (float)RS(g_windowWidth);
 	const float crh = clipRectH * (float)RS(g_windowHeight);
-	(void)vpY; (void)vpH;
 
 	glScissor(crx, flipOffset - cry, crw, crh);
 #endif
@@ -5845,6 +5813,16 @@ extern "C" int PsyX_MapWindowToViewport(int mx, int my, float* outFracX, float* 
 	if (outFracY) *outFracY = fy;
 	return (fx >= 0.0f && fx <= 1.0f && fy >= 0.0f && fy <= 1.0f) ? 1 : 0;
 }
+
+/* PC port: the window sub-rect the game is actually presented into (pillarbox
+ * leaves black bars at the sides). The framebuffer-feedback capture must read
+ * THIS, not the whole window: squashing the full window into the 320x224
+ * feedback buffer shrinks the image horizontally by vpW/windowWidth, and because
+ * the effect re-reads its own output every frame that scale compounds — the
+ * picture collapses toward the centre and builds up a vertical line after a few
+ * seconds. Recorded from the same block that calls GR_SetViewPort so the two can
+ * never disagree. */
+static int g_presentVp[4] = { 0, 0, 0, 0 };
 
 /* Window rect (GL coords, x0/y0/x1/y1, origin bottom-left) that the PSX display
  * buffer occupies under the world ortho. Set alongside g_presentVp; this is what
