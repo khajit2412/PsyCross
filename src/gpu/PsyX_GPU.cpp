@@ -4182,50 +4182,6 @@ void DrawAllSplits()
 #if defined(__vita__)
 	const unsigned long long sb0 = SPLIT_T();
 	s_drawVerts = g_vertexBuffer;
-	{
-		/* [BARDRAW]: on 2D screens, any split drawn outside the PSX display
-		 * area lands in the pillarbox bars (the Konami logo beside the title). */
-		extern int g_PcHorPlusEnabled;
-		static int s_barLogs = 0;
-		if (!g_PcHorPlusEnabled && s_barLogs < 24)
-		{
-			const int dw = activeDispEnv.disp.w, dh = activeDispEnv.disp.h;
-			for (int i = 1; i <= g_splitIndex && s_barLogs < 24; i++)
-			{
-				const GPUDrawSplit& sp = g_splits[i];
-				if (sp.kind != GPU_SPLIT_LEGACY || sp.numVerts == 0)
-					continue;
-				int x0 = 32767, x1 = -32768, y0 = 32767, y1 = -32768;
-				for (unsigned v = 0; v < sp.numVerts; v++)
-				{
-					const GrVertex& g = g_vertexBuffer[sp.startVertex + v];
-					if (g.x < x0) x0 = g.x;
-					if (g.x > x1) x1 = g.x;
-					if (g.y < y0) y0 = g.y;
-					if (g.y > y1) y1 = g.y;
-				}
-				if (x0 < -1 || x1 > dw + 1)
-				{
-					const GrVertex& g = g_vertexBuffer[sp.startVertex];
-					static unsigned s_barSeen[32];
-					const unsigned sig = ((unsigned)(x0 & 0x7FF) << 21) ^ ((unsigned)(x1 & 0x7FF) << 10) ^
-					                     ((unsigned)(unsigned short)g.page << 4) ^ (unsigned)(unsigned short)g.clut ^
-					                     ((unsigned)sp.textureId << 16) ^ (unsigned)(y0 & 0x3FF);
-					int k;
-					for (k = 0; k < s_barLogs && s_barSeen[k] != sig; k++) {}
-					if (k < s_barLogs)
-						continue;
-					s_barSeen[s_barLogs] = sig;
-					s_barLogs++;
-					eprintf("[BARDRAW] split %d: x %d..%d y %d..%d (disp %dx%d) verts=%u tex=%u fmt=%d blend=%d page=0x%x clut=0x%x uv=%d,%d dfe=%d clip=%d,%d %dx%d ofs=%d,%d\n",
-					        i, x0, x1, y0, y1, dw, dh, sp.numVerts, (unsigned)sp.textureId, (int)sp.texFormat,
-					        (int)sp.blendMode, (unsigned)(unsigned short)g.page, (unsigned)(unsigned short)g.clut,
-					        g.u, g.v, sp.drawenv.dfe, sp.drawenv.clip.x, sp.drawenv.clip.y, sp.drawenv.clip.w,
-					        sp.drawenv.clip.h, sp.drawenv.ofs[0], sp.drawenv.ofs[1]);
-				}
-			}
-		}
-	}
 
 	int inlineOnly = !VGLR_JobsEnabled();
 	for (int i = 1; i <= g_splitIndex; i++)
